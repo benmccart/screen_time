@@ -58,11 +58,13 @@ public:
 private:
     chrono::seconds append_ellapsed_time();
     chrono::seconds handle_lagout_warning();
-    void force_logout();
+    void force_lock_screen();
 
     static u8string app_path();
-    static nlohmann::json read_config(filesystem::path, string const&);
-    static nlohmann::json read_log(filesystem::path, string const&, chrono::time_point<chrono::system_clock> const&);
+    static void create_app_folder(filesystem::path const&);
+    static nlohmann::json read_config(filesystem::path const&, string const&);
+    static nlohmann::json read_log(filesystem::path const&, string const&, chrono::time_point<chrono::system_clock> const&);
+    static void write_json(filesystem::path const&, nlohmann::json const&);
 
     HWND hwnd_;
     chrono::time_point<chrono::system_clock> t0_;
@@ -81,14 +83,7 @@ private:
     
 };
 
-
-
-
-
-
-
-
-constexpr int timer_id = 42u;
+constexpr int c_timer_id = 42u;
 constexpr UINT timer_ellapse_millisec = 1000u;
 
 // Global Variables and forwards.
@@ -108,12 +103,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     ATOM atom = RegisterCustomWindow(hInstance);
     HWND hWnd = InitInstance(hInstance, atom);
     handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS));
-    
 
     // Main message loop:
-    bool break_here = false;
     time_tracker_t tracker{ hWnd };
-    tracker.update_timer(42);
+    tracker.update_timer(c_timer_id);
+    
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
     {
@@ -131,7 +125,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
             break;
         }
     }
-
 
     handle_win32_result(::WTSUnRegisterSessionNotification(hWnd));
     return (int) msg.wParam;
@@ -158,15 +151,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         bool break_here = false;
         int wmId = LOWORD(wParam);
-        // Parse the menu selections:
         switch (wmId)
         {
         case IDM_EXIT:
             ::DestroyWindow(hWnd);
             break;
-        //case WM_WTSSESSION_CHANGE:
-        //    break_here = true;
-        //    break;
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
@@ -230,11 +219,13 @@ time_tracker_t::time_tracker_t(HWND hwnd)
     , user_name_(current_logged_in_user())
     , timer_id_(0u)
     , app_path_(app_path())
-    , config_path_(app_path() + u8string{ u8"config.json" })
-    , log_path_(app_path() + u8string{ u8"log.json" })
+    , config_path_(app_path() + u8string{ u8"\\config.json" })
+    , log_path_(app_path() + u8string{ u8"\\log.json" })
 {
+    create_app_folder(app_path_);
     config_ = read_config(config_path_, user_name_);
     log_ = read_log(log_path_, user_name_, t0_);
+    write_json(config_path_, config_);
 
     accumulated_ = chrono::duration_cast<chrono::seconds>(chrono::minutes{ log_[user_name_]["minutes"] });
     allowed_ = chrono::duration_cast<chrono::seconds>(chrono::minutes{ config_[user_name_] });
@@ -243,26 +234,19 @@ time_tracker_t::time_tracker_t(HWND hwnd)
 
 void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
-    //if (timer_id != timer_id_)
-    //    return;
-
     if (timer_id_ != 0u)
     {
         handle_win32_result(::KillTimer(hwnd_, timer_id_));
     }
-    else
+    else // (timer_id_ == 0u)
     {
-        timer_id_ = 42;
+        timer_id_ = timer_id;
     }
 
-
-
-    // Update timing
+    // Handle append ellapsed time and timer update.
     auto left = append_ellapsed_time();
-
-    // Handle timer update.
     chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(left);
-    int result =/*timer_id_ =*/ ::SetTimer(hwnd_, timer_id_, static_cast<UINT>(timer_amount.count()), nullptr);
+    UINT_PTR result = ::SetTimer(hwnd_, timer_id_, static_cast<UINT>(timer_amount.count()), nullptr);
     if (result == FALSE)
         throw_last_win32_error();
 }
@@ -285,11 +269,13 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     auto ellapsed = now - t0_;
     t0_ = now;
     accumulated_ += chrono::ceil<chrono::seconds>(ellapsed);
+    log_[user_name_]["minutes"] = chrono::floor<chrono::minutes>(accumulated_).count();
+    write_json(log_path_, log_);
 
     // Handle immediate logout!
     if (accumulated_ >= allowed_)
     {
-        force_logout();
+        force_lock_screen();
         return chrono::seconds{ 0u };
     }
 
@@ -303,9 +289,9 @@ chrono::seconds time_tracker_t::handle_lagout_warning()
     {
         string msg = format("User {} has used up screen time for today and will be logged out in less than {}", user_name_, warn_before_logout);
         async(launch::async, [msg]()
-            {
-                ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
-            });
+        {
+            ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
+        });
     }
     else
     {
@@ -315,9 +301,9 @@ chrono::seconds time_tracker_t::handle_lagout_warning()
     return left;
 }
 
-void time_tracker_t::force_logout()
+void time_tracker_t::force_lock_screen()
 {
-    
+    handle_win32_result(::LockWorkStation());
 }
 
 u8string time_tracker_t::app_path()
@@ -334,7 +320,15 @@ u8string time_tracker_t::app_path()
     return app_path.u8string();
 }
 
-nlohmann::json time_tracker_t::read_config(filesystem::path file, string const &user)
+void time_tracker_t::create_app_folder(filesystem::path const& path)
+{
+    if (filesystem::exists(path))
+        return;
+
+    filesystem::create_directories(path);
+}
+
+nlohmann::json time_tracker_t::read_config(filesystem::path const &file, string const &user)
 {
     nlohmann::json config;
     ifstream config_file{ file };
@@ -350,7 +344,7 @@ nlohmann::json time_tracker_t::read_config(filesystem::path file, string const &
     return config;
 }
 
-nlohmann::json time_tracker_t::read_log(filesystem::path file, string const &user, chrono::time_point<chrono::system_clock> const &t0)
+nlohmann::json time_tracker_t::read_log(filesystem::path const &file, string const &user, chrono::time_point<chrono::system_clock> const &t0)
 {
     nlohmann::json log;
     std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(t0) });
@@ -371,4 +365,13 @@ nlohmann::json time_tracker_t::read_log(filesystem::path file, string const &use
     }
 
     return log;
+}
+
+void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json const &json)
+{
+    ofstream out_file{ file };
+    if (!out_file.is_open())
+        throw std::runtime_error{ format("failed to open {} for writing", file.generic_string()) };
+    
+    out_file << json;
 }
