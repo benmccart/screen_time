@@ -19,6 +19,8 @@
 
 #include <nlohmann/json.hpp>
 
+constexpr wchar_t const* window_class_name = L"__screen_time__";
+
 
 
 
@@ -48,16 +50,21 @@ void handle_win32_result(int result)
 class time_tracker_t
 {
 public:
-    time_tracker_t();
-    void update_timer(UINT_PTR, bool);
+    time_tracker_t(HWND);
+    void update_timer(UINT_PTR);
+    void locked();
+    void unlocked();
 
 private:
+    chrono::seconds append_ellapsed_time();
+    chrono::seconds handle_lagout_warning();
     void force_logout();
 
     static u8string app_path();
     static nlohmann::json read_config(filesystem::path, string const&);
     static nlohmann::json read_log(filesystem::path, string const&, chrono::time_point<chrono::system_clock> const&);
 
+    HWND hwnd_;
     chrono::time_point<chrono::system_clock> t0_;
     chrono::seconds accumulated_;
     chrono::seconds allowed_;
@@ -86,7 +93,8 @@ constexpr UINT timer_ellapse_millisec = 1000u;
 
 // Global Variables and forwards.
 HINSTANCE hInst;                                // Current application instance handle.
-BOOL                InitInstance(HINSTANCE, int);
+HWND                InitInstance(HINSTANCE, ATOM);
+ATOM RegisterCustomWindow(HINSTANCE);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -97,32 +105,100 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(lpCmdLine);
 
     // Perform application initialization:
-    if (!InitInstance (hInstance, nCmdShow))
-    {
-        return FALSE;
-    }
+    ATOM atom = RegisterCustomWindow(hInstance);
+    HWND hWnd = InitInstance(hInstance, atom);
+    handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS));
+    
 
     // Main message loop:
-    time_tracker_t tracker;
+    bool break_here = false;
+    time_tracker_t tracker{ hWnd };
+    tracker.update_timer(42);
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
     {
         switch (msg.message)
         {
         case WM_TIMER:
+            tracker.update_timer(msg.wParam); 
+            break;
+
+        case WM_WTSSESSION_CHANGE:
+            if (msg.wParam == WTS_SESSION_LOCK)
+                tracker.locked();
+            if (msg.wParam == WTS_SESSION_UNLOCK)
+                tracker.unlocked();
             break;
         }
     }
 
+
+    handle_win32_result(::WTSUnRegisterSessionNotification(hWnd));
     return (int) msg.wParam;
 }
 
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+HWND InitInstance(HINSTANCE hInstance, ATOM atom)
 {
    hInst = hInstance;
-   /*handle_win32_result(*/::SetTimer(nullptr, timer_id, timer_ellapse_millisec, nullptr)/*)*/;
+   HWND hWnd = CreateWindowW(window_class_name, nullptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+   if (hWnd == nullptr)
+   {
+       throw_last_win32_error();
+   }
 
-   return TRUE;
+   handle_win32_result(::ShowWindow(hWnd, SW_HIDE));
+   return hWnd;
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_COMMAND:
+    {
+        bool break_here = false;
+        int wmId = LOWORD(wParam);
+        // Parse the menu selections:
+        switch (wmId)
+        {
+        case IDM_EXIT:
+            ::DestroyWindow(hWnd);
+            break;
+        //case WM_WTSSESSION_CHANGE:
+        //    break_here = true;
+        //    break;
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
+        }
+    }
+    break;
+    case WM_DESTROY:
+        ::PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+ATOM RegisterCustomWindow(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex;
+    wcex.cbSize = sizeof(WNDCLASSEX);
+
+    wcex.style = CS_NOCLOSE;
+    wcex.lpfnWndProc = WndProc;
+    wcex.cbClsExtra = 0;
+    wcex.cbWndExtra = 0;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = nullptr;
+    wcex.hCursor = nullptr;
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszMenuName = nullptr;
+    wcex.lpszClassName = window_class_name;
+    wcex.hIconSm = nullptr;
+
+    return ::RegisterClassExW(&wcex);
 }
 
 std::string current_logged_in_user()
@@ -146,8 +222,9 @@ std::string current_logged_in_user()
     return "n/a";
 }
 
-time_tracker_t::time_tracker_t()
-    : t0_(chrono::system_clock::now())
+time_tracker_t::time_tracker_t(HWND hwnd)
+    : hwnd_(hwnd)
+    , t0_(chrono::system_clock::now())
     , accumulated_(0u)
     , allowed_(0u)
     , user_name_(current_logged_in_user())
@@ -164,51 +241,78 @@ time_tracker_t::time_tracker_t()
 }
 
 
-void time_tracker_t::update_timer(UINT_PTR timer_id , bool unlocking)
+void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
-    if (timer_id != timer_id_)
-        return;
+    //if (timer_id != timer_id_)
+    //    return;
 
     if (timer_id_ != 0u)
     {
-        handle_win32_result(::KillTimer(nullptr, timer_id_));
+        handle_win32_result(::KillTimer(hwnd_, timer_id_));
+    }
+    else
+    {
+        timer_id_ = 42;
     }
 
-    // Update timing
-    auto now = chrono::system_clock::now();
-    if (unlocking)
-        t0_ = now; // Don't count time while screen was locked!
 
+
+    // Update timing
+    auto left = append_ellapsed_time();
+
+    // Handle timer update.
+    chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(left);
+    int result =/*timer_id_ =*/ ::SetTimer(hwnd_, timer_id_, static_cast<UINT>(timer_amount.count()), nullptr);
+    if (result == FALSE)
+        throw_last_win32_error();
+}
+
+void time_tracker_t::locked()
+{
+    append_ellapsed_time();
+}
+
+void time_tracker_t::unlocked()
+{
+    auto now = chrono::system_clock::now();
+    t0_ = now;
+    update_timer(timer_id_);
+}
+
+chrono::seconds time_tracker_t::append_ellapsed_time()
+{
+    auto now = chrono::system_clock::now();
     auto ellapsed = now - t0_;
+    t0_ = now;
     accumulated_ += chrono::ceil<chrono::seconds>(ellapsed);
 
     // Handle immediate logout!
     if (accumulated_ >= allowed_)
     {
         force_logout();
-        return;
+        return chrono::seconds{ 0u };
     }
 
-    // Handle logout warning.
+    return handle_lagout_warning();
+}
+
+chrono::seconds time_tracker_t::handle_lagout_warning()
+{
     auto left = allowed_ - accumulated_;
     if (chrono::ceil<chrono::minutes>(left) <= warn_before_logout)
     {
         string msg = format("User {} has used up screen time for today and will be logged out in less than {}", user_name_, warn_before_logout);
         async(launch::async, [msg]()
-        {
-            ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
-        });
+            {
+                ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
+            });
     }
     else
     {
         left -= warn_before_logout;
     }
 
-    // Handle timer update.
-    chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(left);
-    timer_id_ = ::SetTimer(nullptr, timer_id_, timer_amount.count(), nullptr);
-    if (timer_id_ == 0u)
-        throw_last_win32_error();
+    return left;
 }
 
 void time_tracker_t::force_logout()
