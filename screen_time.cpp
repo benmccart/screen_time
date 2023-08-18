@@ -99,35 +99,56 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // Perform application initialization:
-    ATOM atom = RegisterCustomWindow(hInstance);
-    HWND hWnd = InitInstance(hInstance, atom);
-    handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS));
-
-    // Main message loop:
-    time_tracker_t tracker{ hWnd };
-    tracker.update_timer(c_timer_id);
-    
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+    try
     {
-        switch (msg.message)
-        {
-        case WM_TIMER:
-            tracker.update_timer(msg.wParam); 
-            break;
+        // Perform application initialization:
+        ATOM atom = RegisterCustomWindow(hInstance);
+        HWND hWnd = InitInstance(hInstance, atom);
+        handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS));
 
-        case WM_WTSSESSION_CHANGE:
-            if (msg.wParam == WTS_SESSION_LOCK)
-                tracker.locked();
-            if (msg.wParam == WTS_SESSION_UNLOCK)
-                tracker.unlocked();
-            break;
+        // Main message loop:
+        time_tracker_t tracker{ hWnd };
+        tracker.update_timer(c_timer_id);
+
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0))
+        {
+            switch (msg.message)
+            {
+            case WM_TIMER:
+                tracker.update_timer(msg.wParam);
+                break;
+
+            case WM_WTSSESSION_CHANGE:
+                if (msg.wParam == WTS_SESSION_LOCK)
+                    tracker.locked();
+                if (msg.wParam == WTS_SESSION_UNLOCK)
+                    tracker.unlocked();
+                break;
+            }
         }
+
+        handle_win32_result(::WTSUnRegisterSessionNotification(hWnd));
+
+    }
+    catch (std::exception const& ex)
+    {
+        string log_file;
+        char const* appdata = ::getenv("APPDATA");
+        if (appdata)
+        {
+            log_file = appdata;
+            log_file += "\\screen_time\\error.log";
+        }
+        else
+        {
+            log_file = "C:\\screen_time_error_log";
+        }
+        ofstream ofs{ log_file };
+        ofs << ex.what();
     }
 
-    handle_win32_result(::WTSUnRegisterSessionNotification(hWnd));
-    return (int) msg.wParam;
+    return 0;
 }
 
 HWND InitInstance(HINSTANCE hInstance, ATOM atom)
