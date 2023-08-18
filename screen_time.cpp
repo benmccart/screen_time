@@ -146,6 +146,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
         ofstream ofs{ log_file };
         ofs << ex.what();
+        return -1;
     }
 
     return 0;
