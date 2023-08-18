@@ -4,18 +4,89 @@
 #include "framework.h"
 #include "screen_time.h"
 
-#define MAX_LOADSTRING 100
+#include "wtsapi32.h"
 
-// Global Variables:
-HINSTANCE hInst;                                // current instance
-WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
-WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
+#include <chrono>
+#include <exception>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <future>
+#include <string>
+#include <string_view>
+#include <system_error>
+//#include <thread>
 
-// Forward declarations of functions included in this code module:
-ATOM                MyRegisterClass(HINSTANCE hInstance);
+#include <nlohmann/json.hpp>
+
+
+
+
+using namespace std;
+
+constexpr unsigned default_screen_time_limit = 60u; // Minutes.
+constexpr chrono::minutes warn_before_logout{ 2u };
+
+
+std::string current_logged_in_user();
+
+void throw_last_win32_error()
+{
+    error_code ec{ static_cast<int>(::GetLastError()), system_category() };
+    if (ec)
+        throw system_error{ ec };
+}
+
+void handle_win32_result(int result)
+{
+    if (result != FALSE)
+        return;
+
+    throw_last_win32_error();
+}
+
+class time_tracker_t
+{
+public:
+    time_tracker_t();
+    void update_timer(UINT_PTR, bool);
+
+private:
+    void force_logout();
+
+    static u8string app_path();
+    static nlohmann::json read_config(filesystem::path, string const&);
+    static nlohmann::json read_log(filesystem::path, string const&, chrono::time_point<chrono::system_clock> const&);
+
+    chrono::time_point<chrono::system_clock> t0_;
+    chrono::seconds accumulated_;
+    chrono::seconds allowed_;
+
+    string user_name_;
+    UINT_PTR timer_id_;
+
+    filesystem::path app_path_;
+    filesystem::path config_path_;
+    filesystem::path log_path_;
+
+    nlohmann::json config_;
+    nlohmann::json log_;
+    
+};
+
+
+
+
+
+
+
+
+constexpr int timer_id = 42u;
+constexpr UINT timer_ellapse_millisec = 1000u;
+
+// Global Variables and forwards.
+HINSTANCE hInst;                                // Current application instance handle.
 BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -25,156 +96,175 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // TODO: Place code here.
-
-    // Initialize global strings
-    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_SCREENTIME, szWindowClass, MAX_LOADSTRING);
-    MyRegisterClass(hInstance);
-
     // Perform application initialization:
     if (!InitInstance (hInstance, nCmdShow))
     {
         return FALSE;
     }
 
-    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_SCREENTIME));
-
-    MSG msg;
-
     // Main message loop:
+    time_tracker_t tracker;
+    MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        switch (msg.message)
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        case WM_TIMER:
+            break;
         }
     }
 
     return (int) msg.wParam;
 }
 
-
-
-//
-//  FUNCTION: MyRegisterClass()
-//
-//  PURPOSE: Registers the window class.
-//
-ATOM MyRegisterClass(HINSTANCE hInstance)
-{
-    WNDCLASSEXW wcex;
-
-    wcex.cbSize = sizeof(WNDCLASSEX);
-
-    wcex.style          = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc    = WndProc;
-    wcex.cbClsExtra     = 0;
-    wcex.cbWndExtra     = 0;
-    wcex.hInstance      = hInstance;
-    wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SCREENTIME));
-    wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
-    wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_SCREENTIME);
-    wcex.lpszClassName  = szWindowClass;
-    wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
-
-    return RegisterClassExW(&wcex);
-}
-
-//
-//   FUNCTION: InitInstance(HINSTANCE, int)
-//
-//   PURPOSE: Saves instance handle and creates main window
-//
-//   COMMENTS:
-//
-//        In this function, we save the instance handle in a global variable and
-//        create and display the main program window.
-//
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
-   hInst = hInstance; // Store instance handle in our global variable
-
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
-
-   if (!hWnd)
-   {
-      return FALSE;
-   }
-
-   ShowWindow(hWnd, nCmdShow);
-   UpdateWindow(hWnd);
+   hInst = hInstance;
+   /*handle_win32_result(*/::SetTimer(nullptr, timer_id, timer_ellapse_millisec, nullptr)/*)*/;
 
    return TRUE;
 }
 
-//
-//  FUNCTION: WndProc(HWND, UINT, WPARAM, LPARAM)
-//
-//  PURPOSE: Processes messages for the main window.
-//
-//  WM_COMMAND  - process the application menu
-//  WM_PAINT    - Paint the main window
-//  WM_DESTROY  - post a quit message and return
-//
-//
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+std::string current_logged_in_user()
 {
-    switch (message)
+    PWTS_SESSION_INFOA sessions = nullptr;
+    DWORD session_count = 0u;
+    handle_win32_result(::WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0u, 1u, &sessions, &session_count));
+
+    for (auto session = sessions; session != sessions + session_count; ++session)
     {
-    case WM_COMMAND:
-        {
-            int wmId = LOWORD(wParam);
-            // Parse the menu selections:
-            switch (wmId)
-            {
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-                break;
-            case IDM_EXIT:
-                DestroyWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
-            }
-        }
-        break;
-    case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            // TODO: Add any drawing code that uses hdc here...
-            EndPaint(hWnd, &ps);
-        }
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        break;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+        if (session->State != WTSActive)
+            continue;
+        
+        LPSTR buffer = nullptr;
+        DWORD bytes = 0u;
+        handle_win32_result(::WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session->SessionId, WTS_INFO_CLASS::WTSUserName, &buffer, &bytes));
+
+        return string{ buffer };
     }
-    return 0;
+
+    return "n/a";
 }
 
-// Message handler for about box.
-INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+time_tracker_t::time_tracker_t()
+    : t0_(chrono::system_clock::now())
+    , accumulated_(0u)
+    , allowed_(0u)
+    , user_name_(current_logged_in_user())
+    , timer_id_(0u)
+    , app_path_(app_path())
+    , config_path_(app_path() + u8string{ u8"config.json" })
+    , log_path_(app_path() + u8string{ u8"log.json" })
 {
-    UNREFERENCED_PARAMETER(lParam);
-    switch (message)
-    {
-    case WM_INITDIALOG:
-        return (INT_PTR)TRUE;
+    config_ = read_config(config_path_, user_name_);
+    log_ = read_log(log_path_, user_name_, t0_);
 
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
-        {
-            EndDialog(hDlg, LOWORD(wParam));
-            return (INT_PTR)TRUE;
-        }
-        break;
+    accumulated_ = chrono::duration_cast<chrono::seconds>(chrono::minutes{ log_[user_name_]["minutes"] });
+    allowed_ = chrono::duration_cast<chrono::seconds>(chrono::minutes{ config_[user_name_] });
+}
+
+
+void time_tracker_t::update_timer(UINT_PTR timer_id , bool unlocking)
+{
+    if (timer_id != timer_id_)
+        return;
+
+    if (timer_id_ != 0u)
+    {
+        handle_win32_result(::KillTimer(nullptr, timer_id_));
     }
-    return (INT_PTR)FALSE;
+
+    // Update timing
+    auto now = chrono::system_clock::now();
+    if (unlocking)
+        t0_ = now; // Don't count time while screen was locked!
+
+    auto ellapsed = now - t0_;
+    accumulated_ += chrono::ceil<chrono::seconds>(ellapsed);
+
+    // Handle immediate logout!
+    if (accumulated_ >= allowed_)
+    {
+        force_logout();
+        return;
+    }
+
+    // Handle logout warning.
+    auto left = allowed_ - accumulated_;
+    if (chrono::ceil<chrono::minutes>(left) <= warn_before_logout)
+    {
+        string msg = format("User {} has used up screen time for today and will be logged out in less than {}", user_name_, warn_before_logout);
+        async(launch::async, [msg]()
+        {
+            ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
+        });
+    }
+    else
+    {
+        left -= warn_before_logout;
+    }
+
+    // Handle timer update.
+    chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(left);
+    timer_id_ = ::SetTimer(nullptr, timer_id_, timer_amount.count(), nullptr);
+    if (timer_id_ == 0u)
+        throw_last_win32_error();
+}
+
+void time_tracker_t::force_logout()
+{
+    
+}
+
+u8string time_tracker_t::app_path()
+{
+    filesystem::path app_path;
+    char const* appdata = ::getenv("APPDATA");
+    if (appdata)
+    {
+        app_path = filesystem::path(appdata);
+        app_path += filesystem::path::preferred_separator;
+    }
+    app_path += filesystem::path{"screen_time"};
+
+    return app_path.u8string();
+}
+
+nlohmann::json time_tracker_t::read_config(filesystem::path file, string const &user)
+{
+    nlohmann::json config;
+    ifstream config_file{ file };
+    if (config_file.is_open())
+    {
+        config_file >> config;
+    }
+    if (!config.contains(user))
+    {
+        config[user] = default_screen_time_limit;
+    }
+
+    return config;
+}
+
+nlohmann::json time_tracker_t::read_log(filesystem::path file, string const &user, chrono::time_point<chrono::system_clock> const &t0)
+{
+    nlohmann::json log;
+    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(t0) });
+    ifstream log_file{ file };
+    if (log_file.is_open())
+    {
+        log_file >> log;
+    }
+    if (!log.contains(user))
+    {
+        log[user]["date"] = today;
+        log[user]["minutes"] = 0u;
+    }
+    else if (today != log[user]["date"])
+    {
+        log[user]["date"] = today;
+        log[user]["minutes"] = 0u;
+    }
+
+    return log;
 }
