@@ -1,6 +1,8 @@
 // screen_time.cpp : Defines the entry point for the application.
 //
 
+#define NOMINMAX 1
+
 #include "framework.h"
 #include "screen_time.h"
 
@@ -28,6 +30,7 @@ using namespace std;
 
 constexpr unsigned default_screen_time_limit = 60u; // Minutes.
 constexpr chrono::minutes warn_before_logout{ 2u };
+constexpr chrono::seconds timer_step{ 60u };
 
 
 std::string current_logged_in_user();
@@ -57,7 +60,7 @@ public:
 
 private:
     chrono::seconds append_ellapsed_time();
-    chrono::seconds handle_lagout_warning();
+    chrono::seconds handle_logout_warning();
     void force_lock_screen();
 
     static u8string app_path();
@@ -266,8 +269,8 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     }
 
     // Handle append ellapsed time and timer update.
-    auto left = append_ellapsed_time();
-    chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(left);
+    auto next = append_ellapsed_time();
+    chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(next);
     UINT_PTR result = ::SetTimer(hwnd_, timer_id_, static_cast<UINT>(timer_amount.count()), nullptr);
     if (result == FALSE)
         throw_last_win32_error();
@@ -301,26 +304,33 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
         return chrono::seconds{ 0u };
     }
 
-    return handle_lagout_warning();
+    return handle_logout_warning();
 }
 
-chrono::seconds time_tracker_t::handle_lagout_warning()
+chrono::seconds time_tracker_t::handle_logout_warning()
 {
-    auto left = allowed_ - accumulated_;
-    if (chrono::ceil<chrono::minutes>(left) <= warn_before_logout)
+    auto warn_fun = [&]( chrono::seconds remaining)
     {
-        string msg = format("User {} has used up screen time for today and will be logged out in less than {}", user_name_, warn_before_logout);
+        string msg = format("User {} has used up screen time for today and will be logged out in {}", user_name_, remaining);
         async(launch::async, [msg]()
         {
             ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
         });
-    }
-    else
+    };
+    if (accumulated_ > allowed_)
     {
-        left -= warn_before_logout;
+        warn_fun(chrono::seconds { 1u });
+        return chrono::seconds { 1u };
     }
 
-    return left;
+    auto left = allowed_ - accumulated_;
+    if (chrono::ceil<chrono::minutes>(left) <= warn_before_logout)
+    {
+        warn_fun(left);
+    }
+
+    auto next = std::min(left, timer_step);
+    return next;
 }
 
 void time_tracker_t::force_lock_screen()
