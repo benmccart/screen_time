@@ -128,6 +128,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                 if (msg.wParam == WTS_SESSION_UNLOCK)
                     tracker.unlocked();
                 break;
+
+            case WM_ENDSESSION:
+            case WM_QUERYENDSESSION:
+                tracker.locked();
+                break;
             }
         }
 
