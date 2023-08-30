@@ -14,6 +14,7 @@
 #include <format>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -34,6 +35,8 @@ constexpr chrono::seconds timer_step{ 60u };
 
 
 std::string current_logged_in_user();
+std::u8string app_path();
+void create_folder(filesystem::path const&);
 
 void throw_last_win32_error()
 {
@@ -50,6 +53,17 @@ void handle_win32_result(int result)
     throw_last_win32_error();
 }
 
+class log_redirect_t
+{
+public:
+    log_redirect_t();
+    ~log_redirect_t();
+
+private:
+    std::streambuf* original_;
+    std::ofstream logfile_;
+};
+
 class time_tracker_t
 {
 public:
@@ -63,10 +77,8 @@ private:
     chrono::seconds handle_logout_warning();
     void force_lock_screen();
 
-    static u8string app_path();
-    static void create_app_folder(filesystem::path const&);
     static nlohmann::json read_config(filesystem::path const&, string const&);
-    static nlohmann::json read_log(filesystem::path const&, string const&, chrono::time_point<chrono::system_clock> const&);
+    static nlohmann::json read_cache(filesystem::path const&, string const&, chrono::time_point<chrono::system_clock> const&);
     static void write_json(filesystem::path const&, nlohmann::json const&);
 
     HWND hwnd_;
@@ -79,7 +91,7 @@ private:
 
     filesystem::path app_path_;
     filesystem::path config_path_;
-    filesystem::path log_path_;
+    filesystem::path cache_path_;
 
     nlohmann::json config_;
     nlohmann::json log_;
@@ -104,6 +116,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     try
     {
+        log_redirect_t redirect{};
+
         // Perform application initialization:
         ATOM atom = RegisterCustomWindow(hInstance);
         HWND hWnd = InitInstance(hInstance, atom);
@@ -146,11 +160,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         if (appdata)
         {
             log_file = appdata;
-            log_file += "\\screen_time\\error.log";
+            log_file += "\\screen_time\\error.txt";
         }
         else
         {
-            log_file = "C:\\screen_time_error_log";
+            log_file = "C:\\screen_time_error_log.txt";
         }
         ofstream ofs{ log_file };
         ofs << ex.what();
@@ -185,6 +199,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
         case IDM_EXIT:
             ::DestroyWindow(hWnd);
+            std::clog << "IDM_EXIT" << std::endl;
             break;
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
@@ -193,6 +208,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     break;
     case WM_DESTROY:
         ::PostQuitMessage(0);
+        std::clog << "WM_DESTROY" << std::endl;
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
@@ -241,6 +257,51 @@ std::string current_logged_in_user()
     return "n/a";
 }
 
+u8string app_path()
+{
+    filesystem::path result;
+    char const* appdata = ::getenv("APPDATA");
+    if (appdata)
+    {
+        result = filesystem::path(appdata);
+        result += filesystem::path::preferred_separator;
+    }
+    result += filesystem::path{"screen_time"};
+
+    return result.u8string();
+}
+
+void create_folder(filesystem::path const& path)
+{
+    if (filesystem::exists(path))
+        return;
+
+    filesystem::create_directories(path);
+}
+
+log_redirect_t::log_redirect_t()
+    : original_(std::clog.rdbuf())
+{
+    filesystem::path path = app_path();
+    create_folder(path);
+
+    path += "\\log.txt";
+    logfile_.open(path);
+    if (logfile_.is_open())
+        std::clog.rdbuf(logfile_.rdbuf());
+    else
+        original_ = nullptr;
+}
+
+log_redirect_t::~log_redirect_t()
+{
+    if (original_)
+    {
+        std::clog.rdbuf(original_);
+        std::clog.flush();
+    }
+}
+
 time_tracker_t::time_tracker_t(HWND hwnd)
     : hwnd_(hwnd)
     , t0_(chrono::system_clock::now())
@@ -250,11 +311,10 @@ time_tracker_t::time_tracker_t(HWND hwnd)
     , timer_id_(0u)
     , app_path_(app_path())
     , config_path_(app_path() + u8string{ u8"\\config.json" })
-    , log_path_(app_path() + u8string{ u8"\\log.json" })
+    , cache_path_(app_path() + u8string{ u8"\\cache.json" })
 {
-    create_app_folder(app_path_);
     config_ = read_config(config_path_, user_name_);
-    log_ = read_log(log_path_, user_name_, t0_);
+    log_ = read_cache(cache_path_, user_name_, t0_);
     write_json(config_path_, config_);
 
     accumulated_ = chrono::duration_cast<chrono::seconds>(chrono::minutes{ log_[user_name_]["minutes"] });
@@ -279,15 +339,19 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     UINT_PTR result = ::SetTimer(hwnd_, timer_id_, static_cast<UINT>(timer_amount.count()), nullptr);
     if (result == FALSE)
         throw_last_win32_error();
+
+    std::clog << "Timer set for '" << next << "' in the future." << std::endl;
 }
 
 void time_tracker_t::locked()
 {
+    std::clog << "Workstation locked for '" << current_logged_in_user() << "'" << std::endl;
     append_ellapsed_time();
 }
 
 void time_tracker_t::unlocked()
 {
+    std::clog << "Workstation unlocked for '" << current_logged_in_user() << "'" << std::endl;
     auto now = chrono::system_clock::now();
     t0_ = now;
     update_timer(timer_id_);
@@ -300,7 +364,7 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     t0_ = now;
     accumulated_ += chrono::ceil<chrono::seconds>(ellapsed);
     log_[user_name_]["minutes"] = chrono::floor<chrono::minutes>(accumulated_).count();
-    write_json(log_path_, log_);
+    write_json(cache_path_, log_);
 
     // Handle immediate logout!
     if (accumulated_ >= allowed_)
@@ -317,6 +381,7 @@ chrono::seconds time_tracker_t::handle_logout_warning()
     auto warn_fun = [&]( chrono::seconds remaining)
     {
         string msg = format("User {} has used up screen time for today and will be logged out in {}", user_name_, remaining);
+        std::clog << msg << std::endl;
         async(launch::async, [msg]()
         {
             ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
@@ -340,29 +405,9 @@ chrono::seconds time_tracker_t::handle_logout_warning()
 
 void time_tracker_t::force_lock_screen()
 {
+    std::clog << "Logging out '" << current_logged_in_user() << "'" << std::endl;
     handle_win32_result(::LockWorkStation());
-}
-
-u8string time_tracker_t::app_path()
-{
-    filesystem::path app_path;
-    char const* appdata = ::getenv("APPDATA");
-    if (appdata)
-    {
-        app_path = filesystem::path(appdata);
-        app_path += filesystem::path::preferred_separator;
-    }
-    app_path += filesystem::path{"screen_time"};
-
-    return app_path.u8string();
-}
-
-void time_tracker_t::create_app_folder(filesystem::path const& path)
-{
-    if (filesystem::exists(path))
-        return;
-
-    filesystem::create_directories(path);
+    std::clog << "Logged out success" << std::endl;
 }
 
 nlohmann::json time_tracker_t::read_config(filesystem::path const &file, string const &user)
@@ -381,27 +426,27 @@ nlohmann::json time_tracker_t::read_config(filesystem::path const &file, string 
     return config;
 }
 
-nlohmann::json time_tracker_t::read_log(filesystem::path const &file, string const &user, chrono::time_point<chrono::system_clock> const &t0)
+nlohmann::json time_tracker_t::read_cache(filesystem::path const &file, string const &user, chrono::time_point<chrono::system_clock> const &t0)
 {
-    nlohmann::json log;
+    nlohmann::json cache;
     std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(t0) });
     ifstream log_file{ file };
     if (log_file.is_open())
     {
-        log_file >> log;
+        log_file >> cache;
     }
-    if (!log.contains(user))
+    if (!cache.contains(user))
     {
-        log[user]["date"] = today;
-        log[user]["minutes"] = 0u;
+        cache[user]["date"] = today;
+        cache[user]["minutes"] = 0u;
     }
-    else if (today != log[user]["date"])
+    else if (today != cache[user]["date"])
     {
-        log[user]["date"] = today;
-        log[user]["minutes"] = 0u;
+        cache[user]["date"] = today;
+        cache[user]["minutes"] = 0u;
     }
 
-    return log;
+    return cache;
 }
 
 void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json const &json)
