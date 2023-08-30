@@ -452,8 +452,8 @@ nlohmann::json time_tracker_t::read_cache(filesystem::path const &file, string c
 void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json const &json)
 {
     ofstream out_file{ file };
-    if (!out_file.is_open())
-        throw std::runtime_error{ format("failed to open {} for writing", file.generic_string()) };
-    
-    out_file << json;
+    if (out_file.is_open())
+    {
+        out_file << json << std::endl;
+    }
 }
