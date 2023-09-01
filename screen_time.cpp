@@ -500,7 +500,7 @@ void time_tracker_t::force_lock_screen()
     HANDLE hToken = nullptr;
     handle_win32_result(::WTSQueryUserToken(current_user_.session_id, &hToken));
     handle_win32_result(::ImpersonateLoggedOnUser(hToken));
-    handle_win32_result(::LockWorkStation());
+    handle_win32_result(::ExitWindowsEx(EWX_LOGOFF, 0xFFFFFFFF)); // EWX_FORCE ???
     handle_win32_result(::RevertToSelf());
     std::clog << "Logged out success" << std::endl;
 }
