@@ -19,17 +19,16 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-//#include <thread>
 
 #include <nlohmann/json.hpp>
 
 constexpr wchar_t const* window_class_name = L"__screen_time__";
-
-
-
+constexpr LPCSTR reg_cache_key = "SOFTWARE\\screen_time";
+constexpr LPCSTR reg_cache_minutes = "minutes";
+constexpr LPCSTR reg_cache_seconds = "seconds";
+constexpr LPCSTR reg_cache_date = "date";
 
 using namespace std;
-
 constexpr unsigned default_screen_time_limit = 60u; // Minutes.
 constexpr chrono::minutes warn_before_logout{ 2u };
 constexpr chrono::seconds timer_step{ 60u };
@@ -60,6 +59,14 @@ void handle_win32_result(int result)
     throw_last_win32_error();
 }
 
+void handle_registry_result(int result)
+{
+    if (result == ERROR_SUCCESS)
+        return;
+
+    throw_last_win32_error();
+}
+
 class log_redirect_t
 {
 public:
@@ -84,38 +91,39 @@ private:
     {
         chrono::seconds accumulated = chrono::seconds{ 0u };
         chrono::seconds allowed = chrono::seconds{ 0u };
+        std::string date;
         user_t user;
     };
-    using user_records_t = std::map<std::string, user_record_t>;
+    
+    struct reg_key_closer_t
+    {
+        using pointer = HKEY;
+        void operator()(HKEY key) const { ::RegCloseKey(key); }
+    };
+    using regkey_ptr = std::unique_ptr<HKEY, reg_key_closer_t>;
 
     chrono::seconds append_ellapsed_time();
     chrono::seconds handle_logout_warning(user_record_t const&);
     void force_lock_screen();
-    user_record_t& user_record(std::string const&);
     chrono::seconds allowed_user_time(std::string const&) const;
 
     static nlohmann::json read_config(filesystem::path const&);
-    user_records_t read_cache(filesystem::path const&) const;
+    user_record_t read_cache() const;
     static void write_json(filesystem::path const&, nlohmann::json const&);
-    void cache_user_records() const;
+    void cache_user_record() const;
     
 
     HWND hwnd_;
     chrono::time_point<chrono::system_clock> t0_;
 
-    std::map<std::string, user_record_t> user_records_;
-
-    user_t current_user_;
+    user_record_t record_;
     UINT_PTR timer_id_;
 
     filesystem::path app_path_;
     filesystem::path config_path_;
-    filesystem::path cache_path_;
 
     nlohmann::json config_;
     std::vector<std::future<void>> futures_;
-    
-
 };
 
 constexpr int c_timer_id = 42u;
@@ -315,7 +323,7 @@ u8string config_path()
 {
     filesystem::path result;
     std::array<char, 512> buffer;
-    int bytes = ::GetModuleFileNameA(nullptr, buffer.data(), buffer.size());
+    int bytes = ::GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
     if (bytes > 0)
     {
         result = filesystem::path{ buffer.data() };
@@ -365,19 +373,15 @@ time_tracker_t::time_tracker_t(HWND hwnd)
     , timer_id_(0u)
     , app_path_(app_path())
     , config_path_(config_path() + u8string{ u8"\\config.json" })
-    , cache_path_(app_path() + u8string{ u8"\\cache.json" })
 {
     config_ = read_config(config_path_);
-    user_records_ = read_cache(cache_path_);
+    record_ = read_cache();
     futures_.reserve(128);
 }
 
 
 void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
-    if (current_user_.name.empty())
-        return;
-
     if (timer_id_ != 0u)
     {
         handle_win32_result(::KillTimer(hwnd_, timer_id_));
@@ -399,18 +403,13 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
 
 void time_tracker_t::locked()
 {
-    if (current_user_.name.empty())
-        current_user_ = current_logged_in_user();
-
-    std::clog << "Workstation locked for '" << current_user_.name << "'" << std::endl;
+    std::clog << "Workstation locked" << std::endl;
     append_ellapsed_time();
-    current_user_ = user_t{};
 }
 
 void time_tracker_t::unlocked()
 {
-    current_user_ = current_logged_in_user();
-    std::clog << "Workstation unlocked for '" << current_user_.name << "'" << std::endl;
+    std::clog << "Workstation unlocked" << std::endl;
     auto now = chrono::system_clock::now();
     t0_ = now;
     update_timer(timer_id_);
@@ -418,50 +417,43 @@ void time_tracker_t::unlocked()
 
 chrono::seconds time_tracker_t::append_ellapsed_time()
 {
-    assert(!current_user_.name.empty());
+    auto current_user = current_logged_in_user();
+    if (current_user.name != record_.user.name)
+        return chrono::minutes{ 1 };
+
     auto now = chrono::system_clock::now();
     auto ellapsed = now - t0_;
     t0_ = now;
 
-    user_record_t& record = user_record(current_user_.name);
-    record.accumulated += chrono::ceil<chrono::seconds>(ellapsed);
-    cache_user_records();
+    record_.accumulated += chrono::ceil<chrono::seconds>(ellapsed);
+    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(now) });
+    if (record_.date != today)
+    {
+        record_.accumulated = chrono::seconds{ 0u };
+        record_.date = today;
+    }
+    cache_user_record();
 
     // Handle immediate logout!
-    if (record.accumulated >= record.allowed)
+    if (record_.accumulated >= record_.allowed)
     {
         force_lock_screen();
         return chrono::seconds{ 0u };
     }
 
-    return handle_logout_warning(record);
+    return handle_logout_warning(record_);
 }
 
 chrono::seconds time_tracker_t::handle_logout_warning(user_record_t const &record)
 {
     auto warn_fun = [&]( chrono::seconds remaining)
     {
-        DWORD session_id = current_user_.session_id;
-        string msg = format("User {} has used up screen time for today and will be logged out in {}", current_user_.name, remaining);
+        string msg = format("User {} has used up screen time for today and will be logged out in {}", record_.user.name, remaining);
         std::clog << msg << std::endl;
-        std::future<void> future = async(launch::async, [msg, session_id]()
+        std::future<void> future = async(launch::async, [msg]()
         {
-             HANDLE hToken = nullptr;
-             if (!::WTSQueryUserToken(session_id, &hToken))
-             {
-                 std::error_code ec{ static_cast<int>(::GetLastError()), std::system_category() };
-                 std::clog << "ERROR: Failed to get user token (" << ec.value() << ") '" << ec.message() << "'" << std::endl;
-                 return;
-             }
-             
-             if (!::ImpersonateLoggedOnUser(hToken))
-             {
-                 std::error_code ec{ static_cast<int>(::GetLastError()), std::system_category() };
-                 std::clog << "ERROR: Failed to impersonate logged in user (" << ec.value() << ") '" << ec.message() << "'" << std::endl;
-                 return;
-             }
-
-             ::MessageBoxA(nullptr, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
+            HWND hDesktop = ::GetDesktopWindow();
+            ::MessageBoxA(hDesktop, msg.c_str(), "Logout Warning", MB_OK | MB_ICONWARNING);
         });
 
         futures_.push_back(std::move(future));
@@ -473,7 +465,7 @@ chrono::seconds time_tracker_t::handle_logout_warning(user_record_t const &recor
 		    	return true;
 		    }
 
-				return false;
+			return false;
 		});
         futures_.erase(itr, std::end(futures_));
     };
@@ -495,31 +487,16 @@ chrono::seconds time_tracker_t::handle_logout_warning(user_record_t const &recor
 
 void time_tracker_t::force_lock_screen()
 {
-    std::clog << "Logging out '" << current_user_.name << "'" << std::endl;
-
-    HANDLE hToken = nullptr;
-    handle_win32_result(::WTSQueryUserToken(current_user_.session_id, &hToken));
-    handle_win32_result(::ImpersonateLoggedOnUser(hToken));
-    handle_win32_result(::ExitWindowsEx(EWX_LOGOFF, 0xFFFFFFFF)); // EWX_FORCE ???
-    handle_win32_result(::RevertToSelf());
-    std::clog << "Logged out success" << std::endl;
+    std::clog << "Locking Screen" << std::endl;
+    handle_win32_result(::LockWorkStation());
+    std::clog << "Screen Locked" << std::endl;
 }
 
-time_tracker_t::user_record_t& time_tracker_t::user_record(std::string const &user)
+chrono::seconds time_tracker_t::allowed_user_time(std::string const& name) const
 {
-    if (!user_records_.contains(user))
-    {
-        user_record_t record;
-        record.allowed = allowed_user_time(user);
-        user_records_[user] = record;
-    }
-
-    return user_records_[user];
-}
-
-chrono::seconds time_tracker_t::allowed_user_time(std::string const &user) const
-{
-    chrono::minutes minutes = (config_.contains(user)) ? chrono::minutes{ static_cast<unsigned>(config_[user]) } : chrono::minutes{ default_screen_time_limit };
+    chrono::minutes minutes = (config_.contains(name)) ? 
+        chrono::minutes{ static_cast<unsigned>(config_[name]) } : 
+        chrono::minutes{ default_screen_time_limit };
     return chrono::duration_cast<chrono::seconds>(minutes);
 }
 
@@ -539,49 +516,41 @@ nlohmann::json time_tracker_t::read_config(filesystem::path const &file)
     return config;
 }
 
-time_tracker_t::user_records_t time_tracker_t::read_cache(filesystem::path const &file) const
+time_tracker_t::user_record_t time_tracker_t::read_cache() const
 {
-    user_records_t records;
-    nlohmann::json cache;
+    user_record_t record;
+    DWORD reg_minutes = 0u;
+    DWORD reg_seconds = 0u;
+    DWORD data_size = sizeof(DWORD);
+    LSTATUS status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_minutes, RRF_RT_REG_DWORD, nullptr, &reg_minutes, &data_size);
+    if (status == ERROR_SUCCESS)
+    {
+        record.accumulated = chrono::duration_cast<chrono::seconds>(chrono::minutes{ reg_minutes });
+    }
+    data_size = sizeof(DWORD);
+    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_minutes, RRF_RT_REG_DWORD, nullptr, &reg_minutes, &data_size);
+    if (status == ERROR_SUCCESS)
+    {
+        record.accumulated += chrono::seconds{ reg_seconds };
+    }
 
-    std::clog << "reading cache from: " << file << std::endl;
+    std::array<char, 64u> buffer;
+    data_size = static_cast<DWORD>(buffer.size());
+    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_date, RRF_RT_REG_EXPAND_SZ, nullptr, buffer.data(), &data_size);
+    if (status == ERROR_SUCCESS)
+    {
+        record.date = buffer.data();
+    }
     std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(chrono::system_clock::now()) });
+    if (record.date != today)
     {
-        ifstream log_file{ file };
-        if (log_file.is_open())
-        {
-            log_file >> cache;
-        }
-        else
-        {
-            std::clog << "Error: failed to open json file for reading: " << file << std::endl;
-        }
+        record.accumulated = chrono::seconds{ 0u };
+        record.date = today;
     }
 
-    for (auto& [user, config] : config_.items())
-    {
-        if (!cache.contains(user))
-        {
-            cache[user]["date"] = today;
-            cache[user]["minutes"] = 0u;
-        }
-        else if (today != cache[user]["date"])
-        {
-            cache[user]["date"] = today;
-            cache[user]["minutes"] = 0u;
-        }
-    }
-
-    for (auto& [user, args] : cache.items())
-    {
-        user_record_t record;
-        record.allowed = allowed_user_time(user);
-        chrono::minutes accu_minutes = chrono::minutes{ static_cast<unsigned>(cache[user]["minutes"]) };
-        record.accumulated = chrono::duration_cast<chrono::seconds>(accu_minutes);
-        records[user] = record;
-    }
-
-    return records;
+    record.user = current_logged_in_user();
+    record.allowed = allowed_user_time(record.user.name);
+    return record;
 }
 
 void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json const &json)
@@ -597,12 +566,22 @@ void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json con
     }
 }
 
-void time_tracker_t::cache_user_records() const
+void time_tracker_t::cache_user_record() const
 {
-    nlohmann::json cache;
-    for (auto& [user, record] : user_records_)
+    HKEY reg_key = nullptr;
+    LSTATUS status = ::RegOpenKeyA(HKEY_CURRENT_USER, reg_cache_key, &reg_key);
+    if (status != ERROR_SUCCESS)
     {
-        cache[user]["minutes"] = chrono::duration_cast<chrono::minutes>(record.accumulated).count();
+        handle_registry_result(::RegCreateKeyA(HKEY_CURRENT_USER, reg_cache_key, &reg_key));
     }
-    write_json(cache_path_, cache);
+    regkey_ptr key{ reg_key };
+
+    DWORD const minutes = static_cast<DWORD>(chrono::duration_cast<chrono::minutes>(record_.accumulated).count());
+    handle_registry_result(::RegSetValueExA(key.get(), reg_cache_minutes, 0u, REG_DWORD, static_cast<BYTE const*>(static_cast<void const*>(&minutes)), sizeof(minutes)));
+
+    DWORD const seconds = static_cast<DWORD>((record_.accumulated - chrono::duration_cast<chrono::seconds>(chrono::minutes{ minutes })).count());
+    handle_registry_result(::RegSetValueExA(key.get(), reg_cache_seconds, 0u, REG_DWORD, static_cast<BYTE const*>(static_cast<void const*>(&seconds)), sizeof(minutes)));
+
+    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(chrono::system_clock::now()) });
+    handle_registry_result(::RegSetValueExA(key.get(), reg_cache_date, 0u, REG_SZ, static_cast<BYTE const*>(static_cast<void const*>(today.data())), static_cast<DWORD>(today.size() + 1u)));
 }
