@@ -6,6 +6,8 @@
 #include "framework.h"
 #include "screen_time.h"
 
+#include "accctrl.h"
+#include "aclapi.h"
 #include "wtsapi32.h"
 
 #include <chrono>
@@ -40,9 +42,10 @@ struct user_t
 };
 
 user_t current_logged_in_user();
-static std::u8string app_path();
-static std::u8string config_path();
+std::u8string app_path();
+std::u8string config_path();
 void create_folder(filesystem::path const&);
+void make_process_protected();
 
 void throw_last_win32_error()
 {
@@ -144,8 +147,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 	try
 	{
-        std::clog << "begin wWinMain(...)" << std::endl;
-		log_redirect_t redirect{};
+        log_redirect_t redirect{};
+        std::clog << "redirected log" << std::endl;
+        make_process_protected();
+        std::clog << "made process protected" << std::endl;
+		
 
 		// Perform application initialization:
 		ATOM atom = RegisterCustomWindow(hInstance);
@@ -153,8 +159,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS));
 
 		// Main message loop:
+        std::clog << "registered notify for all sessions" << std::endl;
 		time_tracker_t tracker{ hWnd };
+        std::clog << "init tracker" << std::endl;
 		tracker.update_timer(c_timer_id);
+        std::clog << "update timer" << std::endl;
 
 		MSG msg;
 		while (GetMessage(&msg, nullptr, 0, 0))
@@ -341,12 +350,50 @@ void create_folder(filesystem::path const& path)
     filesystem::create_directories(path);
 }
 
+void make_process_protected()
+{
+    struct handle_closer_t
+    {
+        using pointer = HANDLE;
+        void operator()(HANDLE handle) const { ::CloseHandle(handle); }
+    };
+    using handle_ptr = std::unique_ptr<HANDLE, handle_closer_t>;
+
+    struct acl_free_t
+    {
+        using pointer = PACL;
+        void operator()(PACL acl) const { ::LocalFree(acl); }
+    };
+    using acl_ptr = std::unique_ptr<PACL, acl_free_t>;
+
+    EXPLICIT_ACCESS_A denyAccess = { 0 };
+    constexpr DWORD dwAccessPermissions = GENERIC_WRITE | PROCESS_ALL_ACCESS | WRITE_DAC | DELETE | WRITE_OWNER | READ_CONTROL;
+    std::string user = "CURRENT_USER";
+    ::BuildExplicitAccessWithNameA(&denyAccess, user.data(), dwAccessPermissions, DENY_ACCESS, NO_INHERITANCE);
+    
+    PACL p_acl = nullptr;
+    if (::SetEntriesInAclA(1, &denyAccess, nullptr, &p_acl) != ERROR_SUCCESS)
+    {
+        throw_last_win32_error();
+    }
+    acl_ptr acl{ p_acl };
+
+    handle_ptr process{ ::GetCurrentProcess() };
+    if (::SetSecurityInfo(process.get(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, acl.get(), nullptr) != ERROR_SUCCESS)
+        throw_last_win32_error();
+}
+
 log_redirect_t::log_redirect_t()
     : original_(std::clog.rdbuf())
 {
+    std::cerr << "log redirect" << std::endl;
     filesystem::path path = app_path();
+    std::cerr << "redirect path: " << path << std::endl;
+
     create_folder(path);
     path += "\\log.txt";
+
+    std::cerr << "log path: " << path << std::endl;
 
     if (filesystem::exists(path))
         filesystem::remove(path);
@@ -356,6 +403,8 @@ log_redirect_t::log_redirect_t()
         std::clog.rdbuf(logfile_.rdbuf());
     else
         original_ = nullptr;
+
+    std::cerr << "log redirect complete" << std::endl;
 }
 
 log_redirect_t::~log_redirect_t()
@@ -568,6 +617,8 @@ void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json con
 
 void time_tracker_t::cache_user_record() const
 {
+    std::clog << "cache_user_record() begin" << std::endl;
+
     HKEY reg_key = nullptr;
     LSTATUS status = ::RegOpenKeyA(HKEY_CURRENT_USER, reg_cache_key, &reg_key);
     if (status != ERROR_SUCCESS)
@@ -584,4 +635,6 @@ void time_tracker_t::cache_user_record() const
 
     std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(chrono::system_clock::now()) });
     handle_registry_result(::RegSetValueExA(key.get(), reg_cache_date, 0u, REG_SZ, static_cast<BYTE const*>(static_cast<void const*>(today.data())), static_cast<DWORD>(today.size() + 1u)));
+
+    std::clog << "cache_user_record() complete" << std::endl;
 }
