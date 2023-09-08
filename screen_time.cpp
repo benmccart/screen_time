@@ -452,14 +452,14 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
 
 void time_tracker_t::locked()
 {
-    std::clog << "Workstation locked" << std::endl;
+    std::clog << "Workstation locked (" << chrono::system_clock::now() << ")" << std::endl;
     append_ellapsed_time();
 }
 
 void time_tracker_t::unlocked()
 {
-    std::clog << "Workstation unlocked" << std::endl;
     auto now = chrono::system_clock::now();
+    std::clog << "Workstation unlocked (" << now << ")" << std::endl;
     t0_ = now;
     update_timer(timer_id_);
 }
@@ -468,7 +468,10 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 {
     auto current_user = current_logged_in_user();
     if (current_user.name != record_.user.name)
+    {
+        std::clog << "timed user is '" << record_.user.name << "' but current user is '" << current_user.name << "'" << std::endl;
         return chrono::minutes{ 1 };
+    }
 
     auto now = chrono::system_clock::now();
     auto ellapsed = now - t0_;
@@ -478,6 +481,7 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(now) });
     if (record_.date != today)
     {
+        std::clog << "reset date from '" << record_.date << "' to '" << today << "' (" << now << ")" << std::endl;
         record_.accumulated = chrono::seconds{ 0u };
         record_.date = today;
     }
@@ -617,7 +621,6 @@ void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json con
 
 void time_tracker_t::cache_user_record() const
 {
-    std::clog << "cache_user_record() begin" << std::endl;
 
     HKEY reg_key = nullptr;
     LSTATUS status = ::RegOpenKeyA(HKEY_CURRENT_USER, reg_cache_key, &reg_key);
@@ -633,8 +636,7 @@ void time_tracker_t::cache_user_record() const
     DWORD const seconds = static_cast<DWORD>((record_.accumulated - chrono::duration_cast<chrono::seconds>(chrono::minutes{ minutes })).count());
     handle_registry_result(::RegSetValueExA(key.get(), reg_cache_seconds, 0u, REG_DWORD, static_cast<BYTE const*>(static_cast<void const*>(&seconds)), sizeof(minutes)));
 
-    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(chrono::system_clock::now()) });
-    handle_registry_result(::RegSetValueExA(key.get(), reg_cache_date, 0u, REG_SZ, static_cast<BYTE const*>(static_cast<void const*>(today.data())), static_cast<DWORD>(today.size() + 1u)));
+    handle_registry_result(::RegSetValueExA(key.get(), reg_cache_date, 0u, REG_SZ, static_cast<BYTE const*>(static_cast<void const*>(record_.date.data())), static_cast<DWORD>(record_.date.size() + 1u)));
 
-    std::clog << "cache_user_record() complete" << std::endl;
+    std::clog << " cache content -- date:'" << record_.date << "' minutes:" << minutes << " seconds:" << seconds << " (" << chrono::system_clock::now() << ")" << std::endl;
 }
