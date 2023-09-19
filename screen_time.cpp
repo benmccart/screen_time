@@ -86,6 +86,7 @@ class time_tracker_t
 public:
     time_tracker_t(HWND);
     void update_timer(UINT_PTR);
+    void cancel_timer();
     void locked();
     void unlocked();
 
@@ -109,6 +110,8 @@ private:
     chrono::seconds handle_logout_warning(user_record_t const&);
     void force_lock_screen();
     chrono::seconds allowed_user_time(std::string const&) const;
+    static std::string today();
+    static std::string today(chrono::system_clock::time_point const&);
 
     static nlohmann::json read_config(filesystem::path const&);
     user_record_t read_cache() const;
@@ -127,6 +130,7 @@ private:
 
     nlohmann::json config_;
     std::vector<std::future<void>> futures_;
+    bool logged_out_ = false;
 };
 
 constexpr int c_timer_id = 42u;
@@ -431,14 +435,14 @@ time_tracker_t::time_tracker_t(HWND hwnd)
 
 void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
-    if (timer_id_ != 0u)
-    {
-        handle_win32_result(::KillTimer(hwnd_, timer_id_));
-    }
-    else // (timer_id_ == 0u)
+    cancel_timer();
+    if (timer_id_ == 0u)
     {
         timer_id_ = timer_id;
     }
+
+    if (logged_out_ == true)
+        return; // Bail out!
 
     // Handle append ellapsed time and timer update.
     auto next = append_ellapsed_time();
@@ -450,14 +454,30 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     std::clog << "Timer set for '" << next << "' in the future." << std::endl;
 }
 
+void time_tracker_t::cancel_timer()
+{
+    if (timer_id_ != 0u)
+    {
+        handle_win32_result(::KillTimer(hwnd_, timer_id_));
+    }
+}
+
 void time_tracker_t::locked()
 {
     std::clog << "Workstation locked (" << chrono::system_clock::now() << ")" << std::endl;
     append_ellapsed_time();
+
+    auto current_user = current_logged_in_user();
+    if (current_user.name == record_.user.name)
+        logged_out_ = true;
 }
 
 void time_tracker_t::unlocked()
 {
+    auto current_user = current_logged_in_user();
+    if (current_user.name == record_.user.name)
+        logged_out_ = true;
+
     auto now = chrono::system_clock::now();
     std::clog << "Workstation unlocked (" << now << ")" << std::endl;
     t0_ = now;
@@ -478,12 +498,12 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     t0_ = now;
 
     record_.accumulated += chrono::ceil<chrono::seconds>(ellapsed);
-    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(now) });
-    if (record_.date != today)
+    std::string const date = today(now);
+    if (record_.date != date)
     {
-        std::clog << "reset date from '" << record_.date << "' to '" << today << "' (" << now << ")" << std::endl;
+        std::clog << "reset date from '" << record_.date << "' to '" << date << "' (" << date << ")" << std::endl;
         record_.accumulated = chrono::seconds{ 0u };
-        record_.date = today;
+        record_.date = date;
     }
     cache_user_record();
 
@@ -540,9 +560,11 @@ chrono::seconds time_tracker_t::handle_logout_warning(user_record_t const &recor
 
 void time_tracker_t::force_lock_screen()
 {
+
     std::clog << "Locking Screen" << std::endl;
     handle_win32_result(::LockWorkStation());
     std::clog << "Screen Locked" << std::endl;
+    cancel_timer();
 }
 
 chrono::seconds time_tracker_t::allowed_user_time(std::string const& name) const
@@ -551,6 +573,17 @@ chrono::seconds time_tracker_t::allowed_user_time(std::string const& name) const
         chrono::minutes{ static_cast<unsigned>(config_[name]) } : 
         chrono::minutes{ default_screen_time_limit };
     return chrono::duration_cast<chrono::seconds>(minutes);
+}
+
+std::string time_tracker_t::today()
+{
+    return today(chrono::system_clock::now());
+}
+
+std::string time_tracker_t::today(chrono::system_clock::time_point const &now)
+{
+    const std::chrono::zoned_time zt{ std::chrono::current_zone(), now };
+    return std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(zt.get_local_time()) });
 }
 
 nlohmann::json time_tracker_t::read_config(filesystem::path const &file)
@@ -581,7 +614,7 @@ time_tracker_t::user_record_t time_tracker_t::read_cache() const
         record.accumulated = chrono::duration_cast<chrono::seconds>(chrono::minutes{ reg_minutes });
     }
     data_size = sizeof(DWORD);
-    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_minutes, RRF_RT_REG_DWORD, nullptr, &reg_minutes, &data_size);
+    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_minutes, RRF_RT_REG_DWORD, nullptr, &reg_seconds, &data_size);
     if (status == ERROR_SUCCESS)
     {
         record.accumulated += chrono::seconds{ reg_seconds };
@@ -589,16 +622,16 @@ time_tracker_t::user_record_t time_tracker_t::read_cache() const
 
     std::array<char, 64u> buffer;
     data_size = static_cast<DWORD>(buffer.size());
-    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_date, RRF_RT_REG_EXPAND_SZ, nullptr, buffer.data(), &data_size);
+    status = ::RegGetValueA(HKEY_CURRENT_USER, reg_cache_key, reg_cache_date, RRF_RT_REG_SZ, nullptr, buffer.data(), &data_size);
     if (status == ERROR_SUCCESS)
     {
         record.date = buffer.data();
     }
-    std::string const today = std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(chrono::system_clock::now()) });
-    if (record.date != today)
+    std::string const date = today();
+    if (record.date != date)
     {
         record.accumulated = chrono::seconds{ 0u };
-        record.date = today;
+        record.date = date;
     }
 
     record.user = current_logged_in_user();
