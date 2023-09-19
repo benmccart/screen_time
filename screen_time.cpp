@@ -458,7 +458,7 @@ void time_tracker_t::cancel_timer()
 {
     if (timer_id_ != 0u)
     {
-        handle_win32_result(::KillTimer(hwnd_, timer_id_));
+        ::KillTimer(hwnd_, timer_id_);
     }
 }
 
