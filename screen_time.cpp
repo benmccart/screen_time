@@ -86,7 +86,6 @@ class time_tracker_t
 public:
     time_tracker_t(HWND);
     void update_timer(UINT_PTR);
-    void cancel_timer();
     void locked();
     void unlocked();
 
@@ -435,7 +434,10 @@ time_tracker_t::time_tracker_t(HWND hwnd)
 
 void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
-    cancel_timer();
+    if (timer_id_ != 0u)
+    {
+        handle_win32_result(::KillTimer(hwnd_, timer_id_));
+    }
     if (timer_id_ == 0u)
     {
         timer_id_ = timer_id;
@@ -454,14 +456,6 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     std::clog << "Timer set for '" << next << "' in the future." << std::endl;
 }
 
-void time_tracker_t::cancel_timer()
-{
-    if (timer_id_ != 0u)
-    {
-        ::KillTimer(hwnd_, timer_id_);
-    }
-}
-
 void time_tracker_t::locked()
 {
     std::clog << "Workstation locked (" << chrono::system_clock::now() << ")" << std::endl;
@@ -476,7 +470,7 @@ void time_tracker_t::unlocked()
 {
     auto current_user = current_logged_in_user();
     if (current_user.name == record_.user.name)
-        logged_out_ = true;
+        logged_out_ = false;
 
     auto now = chrono::system_clock::now();
     std::clog << "Workstation unlocked (" << now << ")" << std::endl;
@@ -564,7 +558,6 @@ void time_tracker_t::force_lock_screen()
     std::clog << "Locking Screen" << std::endl;
     handle_win32_result(::LockWorkStation());
     std::clog << "Screen Locked" << std::endl;
-    cancel_timer();
 }
 
 chrono::seconds time_tracker_t::allowed_user_time(std::string const& name) const
