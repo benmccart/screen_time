@@ -436,7 +436,7 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
 {
     if (timer_id_ != 0u)
     {
-        handle_win32_result(::KillTimer(hwnd_, timer_id_));
+        ::KillTimer(hwnd_, timer_id_);
     }
     if (timer_id_ == 0u)
     {
@@ -444,7 +444,10 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     }
 
     if (logged_out_ == true)
+    {
+        timer_id_ = 0u;
         return; // Bail out!
+    }
 
     // Handle append ellapsed time and timer update.
     auto next = append_ellapsed_time();
