@@ -38,7 +38,7 @@ constexpr chrono::seconds timer_step{ 60u };
 struct user_t
 {
     std::string name;
-    DWORD session_id = 0u;
+    DWORD session_id = std::numeric_limits<DWORD>::max();
 };
 
 user_t get_user(DWORD);
