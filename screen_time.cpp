@@ -416,6 +416,7 @@ void time_tracker_t::session_suspend(DWORD sessionId)
 
 void time_tracker_t::session_resume(DWORD sessionId)
 {
+    append_ellapsed_time();
     auto user = get_user(sessionId);
     std::clog << "Session resumed for " << user.name << " (" << chrono::system_clock::now() << ")" << std::endl;
 
@@ -484,6 +485,7 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 		}
 		if (pair.second.accumulated >= pair.second.allowed)
 		{
+            std::clog << "user:'" << pair.second.user.name << "' allowed:" << pair.second.allowed << " accumulated:" << pair.second.accumulated << std::endl;
 			force_logout(pair.second.user);
 			continue;
 		}
@@ -495,6 +497,8 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 			send_logout_warning(pair.second.user, remainder);
 		}
 	}
+
+    cache_user_records();
 
 	return min_remainder;
 }
@@ -571,14 +575,25 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
     {
         user_record_t record;
         record.user.name = entry["user"];
+        if (record.user.name.empty())
+        {
+            std::clog << "WARNING: encountered empty user name..." << std::endl;
+            continue;
+        }
+
         record.accumulated = seconds{ static_cast<size_t>(entry["accumulated"]) };
         record.date = entry["date"];
 
         unsigned int allowed_min = config[record.user.name];
         record.allowed = duration_cast<seconds>(minutes{ allowed_min });
+        if (record.allowed.count() < 60)
+            std::clog << "WARNING: encountered allowed time allotment less than 60 seconds!" << std::endl;
+
+        std::clog << "setting configuration for '" << record.user.name << "' allowed:" << record.allowed << " accumulated:" << record.accumulated << std::endl;
         records.insert(make_pair(string{ record.user.name }, move(record)));
     }
 
+    auto now = system_clock::now();
     for (auto &item : config.items())
     {
         auto itr = records.find(item.key());
@@ -588,6 +603,9 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
             record.user.name = item.key();
             unsigned int allowed_min = item.value();
             record.allowed = duration_cast<seconds>(minutes{ allowed_min });
+            record.date = today(now);
+
+            std::clog << "adding missing user from cache: '" << record.user.name << "' allowed:" << record.allowed << std::endl;
             records.insert(make_pair(string{ record.user.name }, move(record)));
         }
     }
