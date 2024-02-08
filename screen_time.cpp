@@ -108,6 +108,7 @@ private:
     };
     using regkey_ptr = std::unique_ptr<HKEY, reg_key_closer_t>;
 
+    void reset_user_day(std::string const&);
     chrono::seconds append_ellapsed_time();
     user_t get_user(DWORD sessionId) const;
     
@@ -119,7 +120,7 @@ private:
     static void send_logout_warning(user_t const&, std::chrono::seconds);
     static void send_msg(user_t const&, std::string const&);
     static std::string today();
-    static std::string today(chrono::system_clock::time_point const&);
+    static std::string day_of(chrono::system_clock::time_point const&);
     static user_records_t read_cache(nlohmann::json const&, nlohmann::json const&);
     static nlohmann::json read_json(filesystem::path const&);
     static void write_json(filesystem::path const&, nlohmann::json const&);
@@ -166,10 +167,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		// Main message loop:
         std::clog << "registered notify for all sessions" << std::endl;
 		time_tracker_t tracker{ hWnd };
-        std::clog << "init tracker" << std::endl;
 		tracker.update_timer(c_timer_id);
-        std::clog << "update timer" << std::endl;
-
 		MSG msg;
 		while (GetMessage(&msg, nullptr, 0, 0))
 		{
@@ -381,13 +379,6 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
         timer_id_ = static_cast<DWORD>(timer_id);
     }
 
-    bool any_logged_in = std::any_of(begin(records_), end(records_), [](auto& pair) { return pair.second.logged_in; });
-    if (!any_logged_in)
-    {
-        timer_id_ = 0u;
-        return;
-    }
-
     // Handle append ellapsed time and timer update.
     auto next = append_ellapsed_time();
     chrono::milliseconds timer_amount = chrono::duration_cast<chrono::milliseconds>(next);
@@ -402,7 +393,7 @@ void time_tracker_t::session_suspend(DWORD sessionId)
 {
     append_ellapsed_time();
     auto user = get_user(sessionId);
-    std::clog << "Session suspended for " << user.name << " (" << chrono::system_clock::now() << ")" << std::endl;
+    std::clog << "Session suspended for '" << user.name << "':" << user.session_id << " (" << chrono::system_clock::now() << ")" << std::endl;
 
     auto itr = records_.find(user.name);
     if (itr == end(records_))
@@ -418,7 +409,7 @@ void time_tracker_t::session_resume(DWORD sessionId)
 {
     append_ellapsed_time();
     auto user = get_user(sessionId);
-    std::clog << "Session resumed for " << user.name << " (" << chrono::system_clock::now() << ")" << std::endl;
+    std::clog << "Session resumed for  '" << user.name << "':" << user.session_id << " (" << chrono::system_clock::now() << ")" << std::endl;
 
     auto itr = records_.find(user.name);
     if (itr == end(records_))
@@ -445,7 +436,7 @@ user_t time_tracker_t::get_user(DWORD sessionId) const
         if (itr == end(records_))
         {
             std::clog << "Failed to find any user for session id " << sessionId << std::endl;
-            return user_t{};
+            return user_t{"", sessionId};
         }
 
         return itr->second.user;
@@ -461,28 +452,37 @@ user_t time_tracker_t::get_user(DWORD sessionId) const
     return user;
 }
 
+void time_tracker_t::reset_user_day(std::string const &today)
+{
+    for (auto& pair : records_)
+    {
+        if (pair.second.date != today)
+        {
+            pair.second.date = today;
+            pair.second.accumulated = std::chrono::seconds{ 0 };
+        }
+    }
+}
+
 chrono::seconds time_tracker_t::append_ellapsed_time()
 {
     using namespace std;
     using namespace std::chrono;
 
+    string const start_day = day_of(t0_);
     auto const now = chrono::system_clock::now();
+    string const todays_date = day_of(now);
+    reset_user_day(todays_date);
+
     auto const ellapsed = now - t0_;
     t0_ = now;
-    string const todays_date = today(now);
-
-    seconds min_remainder = seconds{ 60u * 60u };
+    seconds min_remainder = seconds{ 60u };
 	for (auto& pair : records_)
 	{
 		if (!pair.second.logged_in)
 			continue; // Skip logged out users.
 
 		pair.second.accumulated += duration_cast<seconds>(ellapsed);
-		if (pair.second.date != todays_date)
-		{
-			pair.second.accumulated = seconds{ 0 };
-			pair.second.date = todays_date;
-		}
 		if (pair.second.accumulated >= pair.second.allowed)
 		{
             std::clog << "user:'" << pair.second.user.name << "' allowed:" << pair.second.allowed << " accumulated:" << pair.second.accumulated << std::endl;
@@ -497,7 +497,6 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 			send_logout_warning(pair.second.user, remainder);
 		}
 	}
-
     cache_user_records();
 
 	return min_remainder;
@@ -530,7 +529,7 @@ void time_tracker_t::force_logout(user_t const &user)
     {
         error_code ec{ static_cast<int>(::GetLastError()), system_category() };
         system_error error{ ec };
-        std::clog << "WTSLogoffSession() failed: (" << ec << ") " << error.what() << std::endl;
+        std::clog << "WTSLogoffSession(" << user.session_id << ") failed: (" << ec.value() << ") " << error.what() << std::endl;
 
         std::stringstream ss;
         ss << user.name << " has exceeded allotted time. Log out!";
@@ -540,10 +539,10 @@ void time_tracker_t::force_logout(user_t const &user)
 
 std::string time_tracker_t::today()
 {
-    return today(chrono::system_clock::now());
+    return day_of(chrono::system_clock::now());
 }
 
-std::string time_tracker_t::today(chrono::system_clock::time_point const &now)
+std::string time_tracker_t::day_of(chrono::system_clock::time_point const &now)
 {
     const std::chrono::zoned_time zt{ std::chrono::current_zone(), now };
     return std::format("{0}", chrono::year_month_day{ chrono::floor<chrono::days>(zt.get_local_time()) });
@@ -569,8 +568,9 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
 {
     using namespace std;
     using namespace std::chrono;
-    user_records_t records;
 
+    user_records_t records;
+    string const& date = today();
     for (auto &entry : json)
     {
         user_record_t record;
@@ -583,6 +583,11 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
 
         record.accumulated = seconds{ static_cast<size_t>(entry["accumulated"]) };
         record.date = entry["date"];
+        if (record.date != date)
+        {
+            record.date = date;
+            record.accumulated = seconds{ 0 };
+        }
 
         unsigned int allowed_min = config[record.user.name];
         record.allowed = duration_cast<seconds>(minutes{ allowed_min });
@@ -603,7 +608,7 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
             record.user.name = item.key();
             unsigned int allowed_min = item.value();
             record.allowed = duration_cast<seconds>(minutes{ allowed_min });
-            record.date = today(now);
+            record.date = day_of(now);
 
             std::clog << "adding missing user from cache: '" << record.user.name << "' allowed:" << record.allowed << std::endl;
             records.insert(make_pair(string{ record.user.name }, move(record)));
