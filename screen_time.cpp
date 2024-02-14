@@ -551,15 +551,22 @@ std::string time_tracker_t::day_of(chrono::system_clock::time_point const &now)
 nlohmann::json time_tracker_t::read_json(filesystem::path const &file)
 {
     nlohmann::json json;
-    ifstream file_stream{ file };
-    if (file_stream.is_open())
+    try
     {
-        file_stream >> json;
-        std::clog << "Read json from: " << file << std::endl;
+        ifstream file_stream{ file };
+        if (file_stream.is_open())
+        {
+            file_stream >> json;
+            std::clog << "Read json from: " << file << std::endl;
+        }
+        else
+        {
+            std::clog << "Did not open json file for reading: " << file << std::endl;
+        }
     }
-    else
+    catch (std::exception const& ex)
     {
-        std::clog << "Did not open json file for reading: " << file << std::endl;
+        std::clog << "exception: " << ex.what() << std::endl;
     }
     return json;
 }
