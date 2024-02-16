@@ -41,7 +41,7 @@ struct user_t
     DWORD session_id = std::numeric_limits<DWORD>::max();
 };
 
-user_t get_user(DWORD);
+
 std::u8string app_path();
 std::u8string app_path();
 void create_folder(filesystem::path const&);
@@ -66,6 +66,11 @@ void handle_win32_result(int result, char const*const szFile, int line)
         return;
 
     throw_last_win32_error(szFile, line);
+}
+
+auto system_to_zone(std::chrono::system_clock::time_point tp)
+{
+    return std::chrono::zoned_time{ std::chrono::current_zone(), tp };
 }
 
 class log_redirect_t
@@ -112,25 +117,27 @@ private:
     chrono::seconds append_ellapsed_time();
     user_t get_user(DWORD sessionId) const;
     
-    void force_logout(user_t const&);
-
     void cache_user_records() const;
-    void update_logged_in_users();
+    void force_logout(user_t const&);
     
     static void send_logout_warning(user_t const&, std::chrono::seconds);
     static void send_msg(user_t const&, std::string const&);
     static std::string today();
     static std::string day_of(chrono::system_clock::time_point const&);
-    static user_records_t read_cache(nlohmann::json const&, nlohmann::json const&);
+    static user_records_t read_cache(filesystem::path const&, filesystem::path const&, nlohmann::json const&);
+    static user_records_t parse_cache(nlohmann::json const&, nlohmann::json const&);
+    static void add_default_records(user_records_t&, nlohmann::json const&);
+    
     static nlohmann::json read_json(filesystem::path const&);
     static void write_json(filesystem::path const&, nlohmann::json const&);
 
     HWND hwnd_;
-    chrono::time_point<chrono::system_clock> t0_;
+    chrono::system_clock::time_point t0_;
     DWORD timer_id_ = 0u;
 
     filesystem::path config_path_;
     filesystem::path cache_path_;
+    filesystem::path cache_path_tmp_;
 
     nlohmann::json config_;
     user_records_t records_;
@@ -334,11 +341,7 @@ log_redirect_t::log_redirect_t()
     : original_(std::clog.rdbuf())
 {
     filesystem::path path = app_path() + u8string{ u8"\\log.txt" };
-    if (filesystem::exists(path))
-        logfile_.open(path, std::ios::out | std::ios::in);
-    else
-        logfile_.open(path, std::ios::out);
-    
+    logfile_.open(path, std::ios_base::app);
     if (logfile_.is_open())
         std::clog.rdbuf(logfile_.rdbuf());
     else
@@ -361,10 +364,10 @@ time_tracker_t::time_tracker_t(HWND hwnd)
     , t0_(chrono::system_clock::now())
     , config_path_(app_path() + u8string{ u8"\\config.json" })
     , cache_path_(app_path() + u8string{ u8"\\cache.json" })
+    , cache_path_tmp_(app_path() + u8string{ u8"\\cache.tmp.json" })
 {
     config_ = read_json(config_path_);
-    records_ = read_cache(read_json(cache_path_), config_);
-    update_logged_in_users();
+    records_ = read_cache(cache_path_, cache_path_tmp_, config_);
 }
 
 
@@ -387,19 +390,20 @@ void time_tracker_t::update_timer(UINT_PTR timer_id)
     {
         throw_last_win32_error(__FILE__, __LINE__);
     }
+    cache_user_records();
 }
 
 void time_tracker_t::session_suspend(DWORD sessionId)
 {
     append_ellapsed_time();
     auto user = get_user(sessionId);
-    std::clog << "Session suspended for '" << user.name << "':" << user.session_id << " (" << chrono::system_clock::now() << ")" << std::endl;
+    std::clog << "Session suspended for '" << user.name << "':" << user.session_id << " (" << system_to_zone(chrono::system_clock::now()) << ")" << std::endl;
 
     auto itr = records_.find(user.name);
     if (itr == end(records_))
         return; // User is not a user we care about.
 
-    itr->second.user.session_id = sessionId;
+    itr->second.user.session_id = user.session_id;
     itr->second.logged_in = false;
 
     cache_user_records();
@@ -409,13 +413,13 @@ void time_tracker_t::session_resume(DWORD sessionId)
 {
     append_ellapsed_time();
     auto user = get_user(sessionId);
-    std::clog << "Session resumed for  '" << user.name << "':" << user.session_id << " (" << chrono::system_clock::now() << ")" << std::endl;
+    std::clog << "Session resumed for  '" << user.name << "':" << user.session_id << " (" << system_to_zone(chrono::system_clock::now()) << ")" << std::endl;
 
     auto itr = records_.find(user.name);
     if (itr == end(records_))
         return; // User is not a user we care about.
 
-    itr->second.user.session_id = sessionId;
+    itr->second.user.session_id = user.session_id;
     itr->second.logged_in = true;
 
     update_timer(timer_id_);
@@ -428,18 +432,34 @@ user_t time_tracker_t::get_user(DWORD sessionId) const
     BOOL result = ::WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, sessionId, WTS_INFO_CLASS::WTSUserName, &buffer, &bytes);
     if (result == FALSE)
     {
-        // Couldn't get session directly... search in records.
-        auto itr = std::find_if(begin(records_), end(records_), [&](auto const& pair)
-            {
-                return pair.second.user.session_id == sessionId;
-            });
-        if (itr == end(records_))
+        PWTS_SESSION_INFOA sessions = nullptr;
+        DWORD session_count = 0u;
+        if (::WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0u, 1u, &sessions, &session_count) == FALSE)
         {
             std::clog << "Failed to find any user for session id " << sessionId << std::endl;
-            return user_t{"", sessionId};
+            return user_t{ "", sessionId };
         }
 
-        return itr->second.user;
+        for (auto session = sessions; session != sessions + session_count; ++session)
+        {
+            if (session->State != WTSActive)
+                continue;
+
+            // We found our user, check the session id...
+            if (session->SessionId == sessionId)
+            {
+                std::clog << "Failed to find any user for session id " << sessionId << std::endl;
+                return user_t{ "", sessionId };
+            }
+
+            // Get the real user from a correct sessionID!
+            result = ::WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session->SessionId, WTS_INFO_CLASS::WTSUserName, &buffer, &bytes);
+            if (result == TRUE)
+            {
+                sessionId = session->SessionId;
+                break;
+            }
+        }
     }
 
     user_t user;
@@ -454,10 +474,12 @@ user_t time_tracker_t::get_user(DWORD sessionId) const
 
 void time_tracker_t::reset_user_day(std::string const &today)
 {
+    std::clog << "Resetting user day for cached users." << std::endl;
     for (auto& pair : records_)
     {
         if (pair.second.date != today)
         {
+            std::clog << "Reset day for user: '" << pair.second.user.name << "' to " << today << std::endl;
             pair.second.date = today;
             pair.second.accumulated = std::chrono::seconds{ 0 };
         }
@@ -469,10 +491,11 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     using namespace std;
     using namespace std::chrono;
 
-    string const start_day = day_of(t0_);
     auto const now = chrono::system_clock::now();
+    string const start_day = day_of(t0_);
     string const todays_date = day_of(now);
-    reset_user_day(todays_date);
+    if (start_day != todays_date)
+        reset_user_day(todays_date);
 
     auto const ellapsed = now - t0_;
     t0_ = now;
@@ -492,14 +515,14 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 
 		seconds const remainder = pair.second.allowed - pair.second.accumulated;
 		min_remainder = min(min_remainder, remainder);
+
 		if (remainder <= warn_before_logout)
 		{
 			send_logout_warning(pair.second.user, remainder);
 		}
 	}
-    cache_user_records();
 
-	return min_remainder;
+    return max(min_remainder, seconds{ 1u });
 }
 
 void time_tracker_t::send_logout_warning(user_t const &user, std::chrono::seconds remaining)
@@ -523,7 +546,7 @@ void time_tracker_t::send_msg(user_t const &user, std::string const &msg)
 void time_tracker_t::force_logout(user_t const &user)
 {
     auto now = chrono::system_clock::now();
-    std::clog << "Logging off user " << user.name << " (" << now << ")" << std::endl;
+    std::clog << "Logging off user " << user.name << " (" << system_to_zone(now) << ")" << std::endl;
     BOOL result = ::WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, user.session_id, FALSE);
     if (result == FALSE)
     {
@@ -571,7 +594,32 @@ nlohmann::json time_tracker_t::read_json(filesystem::path const &file)
     return json;
 }
 
-time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& json, nlohmann::json const &config)
+time_tracker_t::user_records_t time_tracker_t::read_cache(filesystem::path const &cache_path, filesystem::path const &tmp_cache_path, nlohmann::json const& config)
+{
+    try
+    {
+        return parse_cache(read_json(cache_path), config);
+    }
+    catch (std::exception const &ex)
+    {
+        std::clog << "Enountered exception parsing primary cache path: " << ex.what() << std::endl;
+        try
+        {
+            return parse_cache(read_json(tmp_cache_path), config);
+        }
+        catch (std::exception const& ex)
+        {
+            std::clog << "Enountered exception parsing temporary cache path: " << ex.what() << std::endl;
+        }
+    }
+
+    // Try to make a default from the config...
+    user_records_t records;
+    add_default_records(records, config);
+    return records;
+}
+
+time_tracker_t::user_records_t time_tracker_t::parse_cache(nlohmann::json const& json, nlohmann::json const &config)
 {
     using namespace std;
     using namespace std::chrono;
@@ -605,8 +653,16 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
         records.insert(make_pair(string{ record.user.name }, move(record)));
     }
 
+    add_default_records(records, config);
+
+    return records;
+}
+
+void time_tracker_t::add_default_records(user_records_t &records, nlohmann::json const &config)
+{
+    using namespace std::chrono;
     auto now = system_clock::now();
-    for (auto &item : config.items())
+    for (auto& item : config.items())
     {
         auto itr = records.find(item.key());
         if (itr == end(records))
@@ -617,12 +673,10 @@ time_tracker_t::user_records_t time_tracker_t::read_cache(nlohmann::json const& 
             record.allowed = duration_cast<seconds>(minutes{ allowed_min });
             record.date = day_of(now);
 
-            std::clog << "adding missing user from cache: '" << record.user.name << "' allowed:" << record.allowed << std::endl;
+            std::clog << "Adding missing user from cache: '" << record.user.name << "' allowed:" << record.allowed << std::endl;
             records.insert(make_pair(string{ record.user.name }, move(record)));
         }
     }
-
-    return records;
 }
 
 void time_tracker_t::cache_user_records() const
@@ -637,38 +691,8 @@ void time_tracker_t::cache_user_records() const
         json.push_back(record);
     }
 
-    write_json(cache_path_, json);
-}
-
-void time_tracker_t::update_logged_in_users()
-{
-    PWTS_SESSION_INFOA sessions = nullptr;
-    DWORD session_count = 0u;
-    BOOL result = ::WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0u, 1u, &sessions, &session_count);
-    if (result == FALSE || sessions == nullptr || session_count == 0)
-    {
-        std::clog << "Failed to update logged in users!" << std::endl;
-        return;
-    }
-
-    for (auto session = sessions; session != sessions + session_count; ++session)
-    {
-        if (session->State != WTSActive)
-            continue;
-
-        LPSTR buffer = nullptr;
-        DWORD bytes = 0u;
-        BOOL result = ::WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, session->SessionId, WTS_INFO_CLASS::WTSUserName, &buffer, &bytes);
-        if (result == FALSE || buffer == nullptr || bytes == 0)
-            continue;
-
-        std::string name = buffer;
-        auto itr = records_.find(name);
-        if (itr == end(records_))
-            continue;
-
-        itr->second.logged_in = true;
-    }
+    write_json(cache_path_tmp_, json);
+    rename(cache_path_tmp_, cache_path_);
 }
 
 void time_tracker_t::write_json(filesystem::path const &file, nlohmann::json const &json)
