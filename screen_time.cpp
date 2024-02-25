@@ -118,7 +118,7 @@ private:
     user_t get_user(DWORD sessionId) const;
     
     void cache_user_records() const;
-    void force_logout(user_t const&);
+    void force_logout(user_record_t&);
     
     static void send_logout_warning(user_t const&, std::chrono::seconds);
     static void send_msg(user_t const&, std::string const&);
@@ -509,7 +509,7 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 		if (pair.second.accumulated >= pair.second.allowed)
 		{
             std::clog << "user:'" << pair.second.user.name << "' allowed:" << pair.second.allowed << " accumulated:" << pair.second.accumulated << std::endl;
-			force_logout(pair.second.user);
+			force_logout(pair.second);
 			continue;
 		}
 
@@ -543,20 +543,24 @@ void time_tracker_t::send_msg(user_t const &user, std::string const &msg)
         std::clog << "sent msg '" << msg << "' to " << user.name << std::endl;
 }
 
-void time_tracker_t::force_logout(user_t const &user)
+void time_tracker_t::force_logout(user_record_t &record)
 {
     auto now = chrono::system_clock::now();
-    std::clog << "Logging off user " << user.name << " (" << system_to_zone(now) << ")" << std::endl;
-    BOOL result = ::WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, user.session_id, FALSE);
+    std::clog << "Logging off user '" << record.user.name << "' (" << system_to_zone(now) << ")" << std::endl;
+    BOOL result = ::WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, record.user.session_id, FALSE);
     if (result == FALSE)
     {
         error_code ec{ static_cast<int>(::GetLastError()), system_category() };
         system_error error{ ec };
-        std::clog << "WTSLogoffSession(" << user.session_id << ") failed: (" << ec.value() << ") " << error.what() << std::endl;
+        std::clog << "WTSLogoffSession(" << record.user.session_id << ") failed: (" << ec.value() << ") " << error.what() << std::endl;
 
         std::stringstream ss;
-        ss << user.name << " has exceeded allotted time. Log out!";
-        send_msg(user, ss.str());
+        ss << "'" << record.user.name << "' has exceeded allotted time. Log out!";
+        send_msg(record.user, ss.str());
+    }
+    else
+    {
+        record.logged_in = false;
     }
 }
 
