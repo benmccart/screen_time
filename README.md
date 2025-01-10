@@ -17,6 +17,6 @@ I have a simple Windows 10 machine set up for my kids for some of their school w
     6. Attemp to restart up to 99 times.
     7. Set "Do not start a new instance" if the task is already running.
 
-The screen_time.exe does not accumulate time when use is logged in but the screen is locked.
+The screen_time.exe does not accumulate time when user is logged in but their screen is locked.
 
 Of course make sure that any accounts that are listed in config.json don't have permission to write to "C:\Program Files\screen_time\" or to cancel or terminate the process.
