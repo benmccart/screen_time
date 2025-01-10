@@ -1,5 +1,20 @@
-// screen_time.cpp : Defines the entry point for the application.
-//
+/**
+ * Copyright (c) 2023-2025 Ben McCart
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+ * to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+ * the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #define NOMINMAX 1
 
@@ -115,6 +130,7 @@ private:
 
     void reset_user_day(std::string const&);
     chrono::seconds append_ellapsed_time();
+    void upate_sessions();
     user_t get_user(DWORD sessionId) const;
     
     void cache_user_records() const;
@@ -500,6 +516,7 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     auto const ellapsed = now - t0_;
     t0_ = now;
     seconds min_remainder = seconds{ 60u };
+    upate_sessions();
 	for (auto& pair : records_)
 	{
 		if (!pair.second.logged_in)
@@ -523,6 +540,41 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
 	}
 
     return max(min_remainder, seconds{ 1u });
+}
+
+void time_tracker_t::upate_sessions()
+{
+    WTS_SESSION_INFO_1A *pSessionInfo = nullptr;
+    DWORD level = 1u;
+    DWORD count = 0u;
+    BOOL result = ::WTSEnumerateSessionsExA(
+        WTS_CURRENT_SERVER_HANDLE,
+        &level,
+        0u,
+        &pSessionInfo,
+        &count);
+
+    if (result == FALSE)
+        return;
+
+    std::span<WTS_SESSION_INFO_1A> sessions{ pSessionInfo, static_cast<std::size_t>(count) };
+    for (auto& session : sessions)
+    {
+        if (session.pUserName == nullptr)
+            continue;
+
+        std::string name = session.pUserName;
+        auto itr = records_.find(name);
+        if (itr == records_.end())
+            continue;
+
+        if (itr->second.user.session_id = user_t{}.session_id)
+            itr->second.user.session_id = session.SessionId;
+
+        itr->second.logged_in = session.State == WTS_CONNECTSTATE_CLASS::WTSActive;
+    }
+
+    ::WTSFreeMemoryExA(WTS_TYPE_CLASS::WTSTypeSessionInfoLevel1, pSessionInfo, count);
 }
 
 void time_tracker_t::send_logout_warning(user_t const &user, std::chrono::seconds remaining)
