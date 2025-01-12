@@ -557,6 +557,16 @@ void time_tracker_t::upate_sessions()
     if (result == FALSE)
         return;
 
+    bool screen_locked = false;
+    HDESK hdesk = ::OpenInputDesktop(0, FALSE, READ_CONTROL);
+    std::array<char, 256> desktopName{'\0'};
+    DWORD needed = 0;
+    if (::GetUserObjectInformationA(hdesk, UOI_NAME, desktopName.data(), desktopName.size(), &needed))
+    {
+        ::CloseDesktop(hdesk);
+        screen_locked = std::string_view{ desktopName.data(), needed-1u } == "Winlogon";
+    }
+
     std::span<WTS_SESSION_INFO_1A> sessions{ pSessionInfo, static_cast<std::size_t>(count) };
     for (auto& session : sessions)
     {
@@ -571,7 +581,7 @@ void time_tracker_t::upate_sessions()
         if (itr->second.user.session_id = user_t{}.session_id)
             itr->second.user.session_id = session.SessionId;
 
-        itr->second.logged_in = session.State == WTS_CONNECTSTATE_CLASS::WTSActive;
+        itr->second.logged_in = !screen_locked && (session.State == WTS_CONNECTSTATE_CLASS::WTSActive);
     }
 
     ::WTSFreeMemoryExA(WTS_TYPE_CLASS::WTSTypeSessionInfoLevel1, pSessionInfo, count);
