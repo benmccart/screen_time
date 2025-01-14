@@ -490,7 +490,10 @@ user_t time_tracker_t::get_user(DWORD sessionId) const
 
 void time_tracker_t::reset_user_day(std::string const &today)
 {
-    std::clog << "Resetting user day for cached users." << std::endl;
+    const std::chrono::zoned_time zt{ std::chrono::current_zone(), std::chrono::system_clock::now() };
+    std::string now_zt = std::format("{0}", zt.get_local_time());
+
+    std::clog << "Resetting user day for cached users @ " << now_zt << std::endl;
     for (auto& pair : records_)
     {
         if (pair.second.date != today)
@@ -557,11 +560,13 @@ void time_tracker_t::upate_sessions()
     if (result == FALSE)
         return;
 
-    bool screen_locked = false;
-    HDESK hdesk = ::OpenInputDesktop(0, FALSE, READ_CONTROL);
+    
+    HDESK hdesk = ::OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
+    bool screen_locked = hdesk == nullptr;
+
     std::array<char, 256> desktopName{'\0'};
     DWORD needed = 0;
-    if (::GetUserObjectInformationA(hdesk, UOI_NAME, desktopName.data(), desktopName.size(), &needed))
+    if (::GetUserObjectInformationA(hdesk, UOI_NAME, desktopName.data(), static_cast<DWORD>(desktopName.size()), &needed))
     {
         ::CloseDesktop(hdesk);
         screen_locked = std::string_view{ desktopName.data(), needed-1u } == "Winlogon";
