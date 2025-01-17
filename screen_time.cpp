@@ -130,7 +130,6 @@ private:
 
     void reset_user_day(std::string const&);
     chrono::seconds append_ellapsed_time();
-    void upate_sessions();
     user_t get_user(DWORD sessionId) const;
     
     void cache_user_records() const;
@@ -176,52 +175,53 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(lpCmdLine);
 
     log_redirect_t redirect{};
-	try
-	{
+    try
+    {
         std::clog << "redirected log" << std::endl;
         make_process_protected();
         std::clog << "made process protected" << std::endl;
 
-		// Perform application initialization:
-		ATOM atom = RegisterCustomWindow(hInstance);
-		HWND hWnd = InitInstance(hInstance, atom);
-		handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS), __FILE__, __LINE__);
+        // Perform application initialization:
+        ATOM atom = RegisterCustomWindow(hInstance);
+        HWND hWnd = InitInstance(hInstance, atom);
+        handle_win32_result(::WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_ALL_SESSIONS), __FILE__, __LINE__);
 
-		// Main message loop:
+        // Main message loop:
         std::clog << "registered notify for all sessions" << std::endl;
-		time_tracker_t tracker{ hWnd };
-		tracker.update_timer(c_timer_id);
-		MSG msg;
-		while (GetMessage(&msg, nullptr, 0, 0))
-		{
-			switch (msg.message)
-			{
-			case WM_TIMER:
-			{
-				tracker.update_timer(msg.wParam);
-			}
-			break;
+        time_tracker_t tracker{ hWnd };
+        tracker.update_timer(c_timer_id);
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0))
+        {
+            switch (msg.message)
+            {
+                case WM_TIMER:
+                {
+                    tracker.update_timer(msg.wParam);
+                }
+                break;
 
-			case WM_WTSSESSION_CHANGE:
-			{
-				switch (msg.wParam)
-				{
-				case WTS_SESSION_LOCK:
-                case WTS_SESSION_LOGOFF:
-                case WTS_REMOTE_DISCONNECT:
-                case WTS_SESSION_TERMINATE:
-					tracker.session_suspend(static_cast<DWORD>(msg.lParam));
-					break;
+                case WM_WTSSESSION_CHANGE:
+                {
+                    switch (msg.wParam)
+                    {
+                        case WTS_CONSOLE_DISCONNECT:
+                        case WTS_SESSION_LOCK:
+                        case WTS_SESSION_LOGOFF:
+                        case WTS_REMOTE_DISCONNECT:
+                        tracker.session_suspend(static_cast<DWORD>(msg.lParam));
+                        break;
 
-				case WTS_SESSION_UNLOCK:
-                case WTS_SESSION_LOGON:
-                case WTS_REMOTE_CONNECT:
-					tracker.session_resume(static_cast<DWORD>(msg.lParam));
-					break;
-				}
-			}
-            break;
-			}
+                        case WTS_CONSOLE_CONNECT:
+                        case WTS_SESSION_UNLOCK:
+                        case WTS_SESSION_LOGON:
+                        case WTS_REMOTE_CONNECT:
+                        tracker.session_resume(static_cast<DWORD>(msg.lParam));
+                        break;
+                    }
+                }
+                break;
+            }
         }
 
         handle_win32_result(::WTSUnRegisterSessionNotification(hWnd), __FILE__, __LINE__);
@@ -416,11 +416,22 @@ void time_tracker_t::session_suspend(DWORD sessionId)
     std::clog << "Session suspended for '" << user.name << "':" << user.session_id << " (" << system_to_zone(chrono::system_clock::now()) << ")" << std::endl;
 
     auto itr = records_.find(user.name);
-    if (itr == end(records_))
-        return; // User is not a user we care about.
-
-    itr->second.user.session_id = user.session_id;
-    itr->second.logged_in = false;
+    if (itr != end(records_))
+    {
+        itr->second.user.session_id = user.session_id;
+        itr->second.logged_in = false;
+    }
+    else
+    {
+        for (auto& pair : records_)
+        {
+            if (pair.second.user.session_id == sessionId)
+            {
+                pair.second.logged_in = false;
+                break;
+            }
+        }
+    }
 
     cache_user_records();
 }
@@ -519,82 +530,34 @@ chrono::seconds time_tracker_t::append_ellapsed_time()
     auto const ellapsed = now - t0_;
     t0_ = now;
     seconds min_remainder = seconds{ 60u };
-    upate_sessions();
-	for (auto& pair : records_)
-	{
-		if (!pair.second.logged_in)
-			continue; // Skip logged out users.
+    for (auto& pair : records_)
+    {
+        if (!pair.second.logged_in)
+            continue; // Skip logged out users.
 
-		pair.second.accumulated += duration_cast<seconds>(ellapsed);
-		if (pair.second.accumulated >= pair.second.allowed)
-		{
+        pair.second.accumulated += duration_cast<seconds>(ellapsed);
+        if (pair.second.accumulated >= pair.second.allowed)
+        {
             std::clog << "user:'" << pair.second.user.name << "' allowed:" << pair.second.allowed << " accumulated:" << pair.second.accumulated << std::endl;
-			force_logout(pair.second);
-			continue;
-		}
+            force_logout(pair.second);
+            continue;
+        }
 
-		seconds const remainder = pair.second.allowed - pair.second.accumulated;
-		min_remainder = min(min_remainder, remainder);
+        seconds const remainder = pair.second.allowed - pair.second.accumulated;
+        min_remainder = min(min_remainder, remainder);
 
-		if (remainder <= warn_before_logout)
-		{
-			send_logout_warning(pair.second.user, remainder);
-		}
-	}
+        if (remainder <= warn_before_logout)
+        {
+            send_logout_warning(pair.second.user, remainder);
+        }
+    }
 
     return max(min_remainder, seconds{ 1u });
 }
 
-void time_tracker_t::upate_sessions()
-{
-    WTS_SESSION_INFO_1A *pSessionInfo = nullptr;
-    DWORD level = 1u;
-    DWORD count = 0u;
-    BOOL result = ::WTSEnumerateSessionsExA(
-        WTS_CURRENT_SERVER_HANDLE,
-        &level,
-        0u,
-        &pSessionInfo,
-        &count);
-
-    if (result == FALSE)
-        return;
-
-    
-    HDESK hdesk = ::OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
-    bool screen_locked = hdesk == nullptr;
-
-    std::array<char, 256> desktopName{'\0'};
-    DWORD needed = 0;
-    if (::GetUserObjectInformationA(hdesk, UOI_NAME, desktopName.data(), static_cast<DWORD>(desktopName.size()), &needed))
-    {
-        ::CloseDesktop(hdesk);
-        screen_locked = std::string_view{ desktopName.data(), needed-1u } == "Winlogon";
-    }
-
-    std::span<WTS_SESSION_INFO_1A> sessions{ pSessionInfo, static_cast<std::size_t>(count) };
-    for (auto& session : sessions)
-    {
-        if (session.pUserName == nullptr)
-            continue;
-
-        std::string name = session.pUserName;
-        auto itr = records_.find(name);
-        if (itr == records_.end())
-            continue;
-
-        if (itr->second.user.session_id = user_t{}.session_id)
-            itr->second.user.session_id = session.SessionId;
-
-        itr->second.logged_in = !screen_locked && (session.State == WTS_CONNECTSTATE_CLASS::WTSActive);
-    }
-
-    ::WTSFreeMemoryExA(WTS_TYPE_CLASS::WTSTypeSessionInfoLevel1, pSessionInfo, count);
-}
-
 void time_tracker_t::send_logout_warning(user_t const &user, std::chrono::seconds remaining)
 {
-	string msg = format("User {} has used up screen time for today and will be logged out in {}", user.name, remaining);
+    string msg = format("User {} has used up screen time for today and will be logged out in {}", user.name, remaining);
     send_msg(user, msg);
 }
 
